@@ -1,0 +1,12 @@
+[Unit]
+Description=PiPA: bridge from Home Assistant's voice to nanobot (127.0.0.1:8901)
+After=pipa-api.service
+
+[Service]
+EnvironmentFile=%h/.config/pipa/secrets.env
+ExecStart=%h/.local/bin/pipa-bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

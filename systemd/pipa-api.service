@@ -1,0 +1,12 @@
+[Unit]
+Description=PiPA: nanobot's API, for Home Assistant's voice (127.0.0.1:8900)
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/pipa/secrets.env
+ExecStart=%h/.local/share/pipa/venv/bin/nanobot serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

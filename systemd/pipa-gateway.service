@@ -1,0 +1,12 @@
+[Unit]
+Description=PiPA: nanobot's gateway (Telegram, reminders, memory)
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/pipa/secrets.env
+ExecStart=%h/.local/share/pipa/venv/bin/nanobot gateway --foreground
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

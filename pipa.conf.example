@@ -1,0 +1,9 @@
+# PiPA's settings, read by install.sh. Copy to pipa.conf (which git ignores) and fill it in.
+
+# The language model: any OpenAI-compatible server, such as llama.cpp's llama-server
+LLM_URL=http://192.168.0.10:8080/v1
+# The model's name on that server (what its /v1/models lists)
+PIPA_MODEL=gemma-4-12b
+
+# Home Assistant, for its MCP server (device control) once HA_TOKEN is in the secrets file
+HA_URL=http://127.0.0.1:8123
