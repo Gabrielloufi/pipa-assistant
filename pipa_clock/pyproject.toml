@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipa-clock"
+version = "0.1.0"
+description = "nanobot plugin: puts the current date, time and channel in every turn's runtime context"
+requires-python = ">=3.11"
+
+[project.entry-points."nanobot.tools"]
+clock = "pipa_clock:ClockTool"
+
+[tool.setuptools]
+py-modules = ["pipa_clock"]

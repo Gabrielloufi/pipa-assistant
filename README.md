@@ -12,14 +12,14 @@ that also runs Home Assistant, but it only needs:
 - a Linux machine next to Home Assistant, with Python 3.11 or newer and systemd (a Raspberry Pi
   5 is enough: the language model runs elsewhere);
 - an OpenAI-compatible language model server, such as llama.cpp's `llama-server` on a PC with a
-  GPU, with a model that handles tool calls (tested with Gemma 4 12B);
+  GPU, with a model that handles tool calls (tested with Gemma 4 12B and Qwen3.5 9B);
 - optionally, Home Assistant 2026.8 or newer, and a Telegram bot.
 
 ```
 phone / satellite ─> Home Assistant's assistant: speech to text ─> conversation ─> text to speech
                        conversation: a known home command ─> Home Assistant itself, no LLM
                                      anything else ─> pipa-bridge (:8901)
-                                                        ─> nanobot API (:8900) ─> the LLM server
+                                                        ─> nanobot API (:8900) ─> pipa-llm-log (:8902) ─> the LLM server
                                                                              └─> Home Assistant MCP
 Telegram ─> nanobot gateway ─┘
 ```
@@ -31,7 +31,9 @@ Telegram ─> nanobot gateway ─┘
 | `configure.py` | run by `install.sh` | Merges PiPA's settings into nanobot's `~/.nanobot/config.json`. |
 | `SOUL.md` | `~/.nanobot/workspace/SOUL.md` | The persona: Brazilian Portuguese, short spoken answers, how to use its tools. |
 | `pipa-bridge` | `~/.local/bin/pipa-bridge` | Home Assistant's OpenAI-style requests to nanobot's API, and back. |
-| `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, and the bridge, as user services. |
+| `pipa-llm-log` | `~/.local/bin/pipa-llm-log` | Passes nanobot's calls to the LLM server and records them, for a page that shows what PiPA asked and what the model answered. |
+| `pipa_clock/` | nanobot's environment | A nanobot plugin: gives the model the current time and the channel on every turn. |
+| `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, the bridge and the call log, as user services. |
 | | `~/.local/share/pipa/venv` | nanobot 0.4.1. |
 | | `~/.config/pipa/secrets.env` | Tokens, readable only by you. Created by the first run. |
 
@@ -47,7 +49,7 @@ cp pipa.conf.example pipa.conf      # the LLM server's address and the model's n
 ```
 
 It installs nanobot in its own environment, points it at your model, installs the persona,
-and starts the three services. Without tokens, PiPA already answers questions and remembers
+and starts the four services. Without tokens, PiPA already answers questions and remembers
 conversations.
 
 ### Your own settings and persona
@@ -57,8 +59,11 @@ conversations.
 a `SOUL.md` there, with a small script that runs this repository's installer:
 
 ```bash
-PIPA_CONF="$HERE/pipa.conf" PIPA_SOUL="$HERE/SOUL.md" exec ../pipa-assistant/install.sh
+PIPA_CONF="$HERE/pipa.conf" PIPA_SOUL="$HERE/SOUL.md" PIPA_USER="$HERE/USER.md" exec ../pipa-assistant/install.sh
 ```
+
+`PIPA_USER` is optional: a first `USER.md` (your name, timezone, language), copied only over
+nanobot's blank template, since PiPA keeps adding to that file.
 
 The installed persona is replaced on every run while its first line (the comment) is there.
 Delete that line in `~/.nanobot/workspace/SOUL.md` to keep edits made there.
@@ -100,6 +105,29 @@ message and keeps the history itself. The bridge:
 - strips markdown and emojis, which the voice would read aloud;
 - answers Home Assistant's setup check itself.
 
+## What PiPA asked the model
+
+nanobot doesn't show what it sends to the model or which tools the model called, and a reply
+can say "agendei" without any reminder behind it. `pipa-llm-log` sits between nanobot and the
+LLM server, passes everything through unchanged (streaming too), and keeps a log with the
+channel (Telegram, voz), your message, the tools offered, what the model called with which
+arguments, its reply, tokens and time. A reply that claims an action without a tool call is
+flagged in red.
+
+The page is at `http://127.0.0.1:8903/` on the Pi, and the installer also serves it on your
+tailnet at `https://<pi>.<tailnet>.ts.net:8444/`; `/api/calls?limit=N` gives the same as JSON.
+The log, `~/.local/state/pipa/llm-calls.jsonl`, holds your conversations: it stays on the Pi
+and is kept under 20 MB. `PIPA_LLM_LOG=0` in `pipa.conf` turns it off.
+
+## The time, and the first message after a restart
+
+nanobot 0.4.1 knows your timezone but never tells the model the time, so the model guessed it
+("me lembra daqui a 1 minuto" became a job every minute, or none). The `pipa_clock` plugin adds
+the current time and the channel to every message, in the runtime context nanobot appends at
+the end, so the prompt the server has cached doesn't change. It also loads nanobot's tokenizer
+at start-up: nanobot otherwise loads it on the first request and meanwhile overestimates that
+request about fourfold, refusing it with a 16k context.
+
 ## Speed
 
 Measured on 2026-11-08, with Gemma 4 12B on an RTX 4070 SUPER (12 GB):
@@ -121,9 +149,10 @@ minutes on that 5,000-token first prompt.
 ## Everyday commands
 
 ```bash
-systemctl --user status pipa-api pipa-gateway pipa-bridge
+systemctl --user status pipa-api pipa-gateway pipa-bridge pipa-llm-log
 journalctl --user -u pipa-bridge -f            # one line per voice turn, with its time
 journalctl --user -u pipa-api -u pipa-gateway  # nanobot
+journalctl _SYSTEMD_USER_UNIT=pipa-gateway.service   # the same, where the user journal isn't kept
 ~/.local/share/pipa/venv/bin/nanobot agent -m "Oi!"   # talk to it in the terminal
 ```
 
@@ -133,7 +162,14 @@ PiPA's memory, sessions and persona are in `~/.nanobot/workspace`.
 
 PiPA is reachable from Telegram, so nanobot's shell tool is off and its file tools stay
 inside its workspace. Its API and the bridge listen on 127.0.0.1 only, with a key between
-them. Home Assistant's token only reaches the entities exposed to voice assistants.
+them. Home Assistant's token only reaches the entities exposed to voice assistants. The
+model-call page shows your conversations: it listens on 127.0.0.1, and the installer
+publishes it only to your tailnet.
+
+Chats with a Telegram bot are not end-to-end encrypted: Telegram stores them on its servers.
+Keep sensitive matters out of them, and give your Telegram account a two-step verification
+password, since whoever logs into it can give PiPA orders. nanobot also has a Signal channel
+(through signal-cli), which is end-to-end encrypted.
 
 ## License
 
