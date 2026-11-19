@@ -1,0 +1,474 @@
+#!/usr/bin/python3 -I
+"""Records every call PiPA (nanobot) makes to its language model, and shows them on a page.
+
+nanobot talks to this proxy instead of the LLM server; it passes each request and response
+through unchanged (streaming too) and keeps a log: which channel (Telegram, voice), the newest
+user message, the tools offered, what the model answered (text or tool calls with their
+arguments), tokens and time. That shows things the chat itself hides, such as a reply saying
+"agendei" without any call to the scheduler.
+
+  127.0.0.1:8902  /v1/...  the proxy, for nanobot (PIPA_LLM_UPSTREAM is the real server)
+  127.0.0.1:8903  /        the page, read-only (published to the tailnet by install.sh)
+                  /api/calls?limit=N   the same as JSON
+
+The log is ~/.local/state/pipa/llm-calls.jsonl, kept under 20 MB (the older half is dropped).
+It holds your conversations: it stays on this Pi, and the page is for your tailnet only.
+"""
+
+import hashlib
+import html
+import http.client
+import json
+import os
+import re
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+UPSTREAM = urlsplit(os.environ.get("PIPA_LLM_UPSTREAM", "http://192.168.0.10:8080/v1"))
+PROXY_PORT = int(os.environ.get("PIPA_LLM_LOG_PORT", "8902"))
+PAGE_PORT = int(os.environ.get("PIPA_LLM_LOG_PAGE_PORT", "8903"))
+LOG = Path.home() / ".local/state/pipa/llm-calls.jsonl"
+PROMPTS = LOG.parent / "llm-prompts"
+MAX_BYTES = 20 * 1024 * 1024
+TAIL = 8  # messages kept per call, besides the system prompt
+TIMEOUT = 900
+_lock = threading.Lock()
+
+
+def text_of(content):
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content or ""
+
+
+def caller_of(client_port):
+    """The cgroup and command line of the process that opened this connection. nanobot's prompts don't say
+    which channel a message came from, but each channel is its own process on this Pi (and the
+    same user): /proc/net/tcp gives the socket of the client's port, /proc/<pid>/fd its owner."""
+    inode = None
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            rows = Path(table).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            if (int(fields[1].rsplit(":", 1)[1], 16) == client_port
+                    and int(fields[2].rsplit(":", 1)[1], 16) == PROXY_PORT):
+                inode = fields[9]
+    if not inode:
+        return ""
+    target = f"socket:[{inode}]"
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == target:
+                    # nanobot renames its process, but its systemd unit shows in the cgroup
+                    return (Path(f"/proc/{pid}/cgroup").read_text()
+                            + Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode())
+        except OSError:  # another user's process, or it just ended
+            continue
+    return ""
+
+
+def channel_of(caller):
+    """pipa-gateway serves Telegram (and runs reminders and memory tasks); pipa-api is the API
+    the voice bridge calls; anything else is nanobot run by hand (a test, or `nanobot agent`)."""
+    for unit, channel in (("pipa-gateway.service", "telegram"), ("pipa-api.service", "voz")):
+        if unit in caller:
+            return channel
+    return "terminal" if "nanobot" in caller else "?"
+
+
+def newest_user_text(messages):
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            text = text_of(message.get("content"))
+            text = re.sub(r"\[Runtime Context[^\]]*\].*?\[/Runtime Context\]", "", text, flags=re.S)
+            return text.strip()
+    return ""
+
+
+def save_system_prompt(messages):
+    """Saves each distinct system prompt once (they are long and rarely change); the log keeps
+    its id, and the page shows it at /prompt/<id>."""
+    system = "\n\n".join(text_of(m.get("content")) for m in messages if m.get("role") == "system")
+    if not system:
+        return None
+    pid = hashlib.sha1(system.encode()).hexdigest()[:12]
+    path = PROMPTS / f"{pid}.txt"
+    if not path.exists():
+        PROMPTS.mkdir(parents=True, exist_ok=True)
+        path.write_text(system)
+    return pid
+
+
+def tail_of(messages, n=TAIL):
+    """The newest messages (system prompt aside), as the model saw them."""
+    tail = []
+    for m in [m for m in messages if m.get("role") != "system"][-n:]:
+        item = {"role": m.get("role"), "content": text_of(m.get("content"))[:4000]}
+        if m.get("tool_calls"):
+            item["tool_calls"] = [{"name": c.get("function", {}).get("name"),
+                                   "arguments": c.get("function", {}).get("arguments")} for c in m["tool_calls"]]
+        if m.get("name"):
+            item["name"] = m["name"]
+        tail.append(item)
+    return tail
+
+
+def summarize_request(body, channel):
+    messages = body.get("messages", [])
+    tools = [t.get("function", {}).get("name", "?") for t in body.get("tools") or []]
+    last = messages[-1] if messages else {}
+    # the pipa_clock plugin names the channel in the runtime context ("Channel: telegram"),
+    # which also tells a reminder firing in the gateway apart from a chat message
+    users = [text_of(m.get("content")) for m in messages if m.get("role") == "user"]
+    newest = users[-1] if users else ""
+    named = re.search(r"^Channel: ([\w-]+)$", newest, re.M)
+    if named:
+        channel = {"api": "voz", "cli": "terminal"}.get(named.group(1), named.group(1))
+    session = re.search(r"^Session: (\S+)$", newest, re.M)  # also from pipa_clock
+    return {
+        "model": body.get("model"),
+        "stream": bool(body.get("stream")),
+        "channel": channel,
+        "turn": bool(named),  # a message from a chat; without it, nanobot's own work (Dream...)
+        "session": session.group(1) if session else None,
+        "user": newest_user_text(messages),
+        "after_tool": last.get("role") == "tool",  # a follow-up call, with a tool's result
+        "n_messages": len(messages),
+        "tools": tools,
+        "options": {k: body[k] for k in ("temperature", "top_p", "max_tokens", "max_completion_tokens",
+                                         "tool_choice", "reasoning_effort") if k in body},
+        "system_prompt": save_system_prompt(messages),
+        "messages_tail": tail_of(messages),
+    }
+
+
+def write_log(entry):
+    with _lock:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > MAX_BYTES:
+            lines = LOG.read_text().splitlines()
+            LOG.write_text("\n".join(lines[len(lines) // 2:]) + "\n")
+        with LOG.open("a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+class Stream:
+    """Rebuilds the reply from server-sent events, as they pass through."""
+
+    def __init__(self):
+        self.content, self.calls, self.finish, self.usage, self.timings = "", {}, None, None, None
+
+    def feed(self, line):
+        if not line.startswith("data:") or line.strip() == "data: [DONE]":
+            return
+        try:
+            event = json.loads(line[5:])
+        except ValueError:
+            return
+        self.usage = event.get("usage") or self.usage
+        self.timings = event.get("timings") or self.timings
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            self.content += delta.get("content") or ""
+            for call in delta.get("tool_calls") or []:
+                slot = self.calls.setdefault(call.get("index", 0), {"name": "", "arguments": ""})
+                function = call.get("function") or {}
+                slot["name"] += function.get("name") or ""
+                slot["arguments"] += function.get("arguments") or ""
+            self.finish = choice.get("finish_reason") or self.finish
+
+    def result(self):
+        return {"content": self.content, "tool_calls": list(self.calls.values()),
+                "finish": self.finish, "usage": self.usage, "timings": self.timings}
+
+
+def result_of(reply):
+    choice = (reply.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    calls = [{"name": c.get("function", {}).get("name"), "arguments": c.get("function", {}).get("arguments")}
+             for c in message.get("tool_calls") or []]
+    return {"content": message.get("content") or "", "tool_calls": calls, "finish": choice.get("finish_reason"),
+            "usage": reply.get("usage"), "timings": reply.get("timings")}
+
+
+class Proxy(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def forward(self, method):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        path = UPSTREAM.path.rstrip("/") + self.path[len("/v1"):] if self.path.startswith("/v1") else self.path
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length", "connection")}
+        start = time.monotonic()
+        logged = method == "POST" and self.path.rstrip("/").endswith("/chat/completions")
+        if logged and not hasattr(self, "channel"):  # once per connection (they are reused)
+            self.channel = channel_of(caller_of(self.client_address[1]))
+        request = summarize_request(json.loads(raw or b"{}"), self.channel) if logged else None
+        connection = http.client.HTTPConnection(UPSTREAM.hostname, UPSTREAM.port or 80, timeout=TIMEOUT)
+        try:
+            connection.request(method, path, body=raw or None, headers=headers)
+            upstream = connection.getresponse()
+        except OSError as err:
+            self.send_error(502, f"LLM server unreachable: {err}")
+            if logged:
+                write_log({"time": datetime.now().isoformat(timespec="seconds"), **request,
+                           "error": str(err), "seconds": round(time.monotonic() - start, 2)})
+            return
+        self.send_response(upstream.status)
+        streaming = "text/event-stream" in (upstream.getheader("Content-Type") or "")
+        for key, value in upstream.getheaders():
+            if key.lower() not in ("transfer-encoding", "connection", "content-length"):
+                self.send_header(key, value)
+        if streaming:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            rebuilt = Stream()
+            while line := upstream.readline():
+                rebuilt.feed(line.decode("utf-8", "replace"))
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(line), line))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            result = rebuilt.result()
+        else:
+            data = upstream.read()
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            result = None
+            if logged:
+                try:
+                    result = result_of(json.loads(data))
+                except ValueError:
+                    result = {"content": data[:500].decode("utf-8", "replace")}
+        connection.close()
+        if logged:
+            write_log({"time": datetime.now().isoformat(timespec="seconds"), **request, "status": upstream.status,
+                       **(result or {}), "seconds": round(time.monotonic() - start, 2)})
+
+    def do_GET(self):
+        self.forward("GET")
+
+    def do_POST(self):
+        self.forward("POST")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def read_calls(limit):
+    if not LOG.exists():
+        return []
+    lines = LOG.read_text().splitlines()[-limit:]
+    return [json.loads(line) for line in reversed(lines) if line.strip()]
+
+
+PAGE_STYLE = """
+:root { color-scheme: light dark; --bg: #f4f4f6; --card: #fff; --text: #1d1d22; --muted: #6b6b75;
+        --tool: #1f6feb; --warn: #b42318;
+        --you-bg: #e8f0ff; --you-line: #2f6fdb; --claude-bg: #fff2dc; --claude-line: #c27803;
+        --pipa-bg: #efecf6; --pipa-line: #7b68b5; }
+@media (prefers-color-scheme: dark) { :root { --bg: #18181b; --card: #232327; --text: #ececf1;
+        --muted: #a0a0aa; --tool: #79aaff; --warn: #ff7b72;
+        --you-bg: #16233a; --you-line: #4c8dff; --claude-bg: #2a2012; --claude-line: #e0a030;
+        --pipa-bg: #221f2d; --pipa-line: #9c8ad8; } }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
+main { max-width: 980px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 0 0 4px; } p.sub { color: var(--muted); margin: 0 0 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip { border-radius: 999px; padding: 4px 12px; cursor: pointer; border-left: 4px solid; font-size: 14px; }
+.block { border-radius: 10px; border-left: 5px solid; padding: 10px 14px; margin-bottom: 12px; }
+.src-you { background: var(--you-bg); border-color: var(--you-line); }
+.src-claude { background: var(--claude-bg); border-color: var(--claude-line); }
+.src-pipa { background: var(--pipa-bg); border-color: var(--pipa-line); }
+header { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 6px; }
+.who { font-weight: 600; }
+.meta { color: var(--muted); font-size: 13px; }
+.turn { background: var(--card); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+.msg { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+a { color: var(--tool); }
+.step { margin: 2px 0 2px 12px; }
+.tool { color: var(--tool); font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.flag { color: var(--warn); font-weight: 600; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 4px; }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; background: rgba(127,127,127,.12);
+      padding: 8px; border-radius: 6px; margin: 8px 0 0; }
+"""
+PAGE_SCRIPT = """
+const KEY = 'pipa-log-hidden';
+let hidden = [];
+try { hidden = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) {}
+const boxes = [...document.querySelectorAll('input[data-filter]')];
+function apply() {
+  hidden = boxes.filter(b => !b.checked).map(b => b.dataset.filter);
+  try { localStorage.setItem(KEY, JSON.stringify(hidden)); } catch (e) {}
+  document.querySelectorAll('section.block').forEach(s => { s.hidden = hidden.includes(s.dataset.source); });
+}
+boxes.forEach(b => { b.checked = !hidden.includes(b.dataset.filter); b.addEventListener('change', apply); });
+apply();
+"""
+GAP = timedelta(minutes=15)  # a longer pause starts a new block
+# Claude's test conversations are named "teste-..." (through the bridge or the API) or
+# "bench-..." (pipa-gabe/bench); nanobot's own prompts are recognized by their wording.
+TEST_SESSION = re.compile(r"(^|[:_-])(teste|bench)", re.I)
+INTERNAL = [("Dream (memória de longo prazo)", re.compile(r"You are running Dream", re.I)),
+            ("resumo da conversa", re.compile(r"compact replacement checkpoint|retained fact|summar", re.I))]
+SOURCES = {"you": "Você", "claude": "Claude (testes)", "pipa": "PiPA (por conta própria)"}
+CLAIM = re.compile(r"\b(agendei|anotei|liguei|desliguei|criei|marquei|lembrete criado)\b", re.I)
+
+
+def last_user_text(c):
+    for m in reversed(c.get("messages_tail") or []):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return c.get("user") or ""
+
+
+def internal_kind(c):
+    text = last_user_text(c)
+    return next((kind for kind, pattern in INTERNAL if pattern.search(text)), None)
+
+
+def source_of(c):
+    """Who started a call: you (Telegram, or Home Assistant's voice later), Claude testing
+    PiPA, or PiPA on its own (Dream, memory, a reminder firing)."""
+    session = c.get("session") or ""
+    turn = c.get("turn")
+    if turn is None:  # logged before "turn" was recorded
+        turn = "Channel:" in last_user_text(c)
+    if c.get("channel") in ("terminal", "teste", "?") or TEST_SESSION.search(session):
+        return "claude"
+    if internal_kind(c) or session.startswith(("cron", "heartbeat", "dream", "system")):
+        return "pipa"
+    if c.get("channel") == "voz" and not session:  # before sessions were logged, only Claude used voice
+        return "claude"
+    return "you" if turn else "pipa"
+
+
+def label_of(c, source):
+    if source == "pipa":
+        session = c.get("session") or ""
+        return internal_kind(c) or ("lembrete" if session.startswith("cron") else "tarefa")
+    return {"telegram": "Telegram", "voz": "voz", "terminal": "terminal", "?": "API"}.get(
+        c.get("channel"), str(c.get("channel")))
+
+
+def blocks_of(calls):
+    """Calls, oldest first, gathered into conversation blocks: same source and conversation,
+    no pause over GAP. Each block holds turns: a message and the calls it caused."""
+    open_blocks, blocks = {}, []
+    for c in calls:
+        source = source_of(c)
+        label = label_of(c, source)
+        key = (source, c.get("session") or label)
+        when = datetime.fromisoformat(c["time"])
+        block = open_blocks.get(key)
+        if block is None or when - block["last"] > GAP:
+            block = {"source": source, "label": label, "first": when, "turns": []}
+            open_blocks[key] = block
+            blocks.append(block)
+        block["last"] = when
+        if c.get("after_tool") and block["turns"]:
+            block["turns"][-1].append(c)
+        else:
+            block["turns"].append([c])
+    return sorted(blocks, key=lambda b: b["last"], reverse=True)
+
+
+def tool_line(t):
+    return (f'<div class="step">→ <span class="tool">{html.escape(t.get("name") or "?")}'
+            f'({html.escape((t.get("arguments") or "")[:160])})</span></div>')
+
+
+def render_turn(turn, source):
+    first, last = turn[0], turn[-1]
+    when = datetime.fromisoformat(first["time"]).strftime("%H:%M:%S")
+    asked = first.get("user") or ""
+    if source == "pipa":
+        asked = asked[:160] + ("…" if len(asked) > 160 else "")
+    who = {"you": "Você", "claude": "Claude", "pipa": "Tarefa"}[source]
+    steps = "".join(tool_line(t) for c in turn for t in c.get("tool_calls") or [])
+    reply = last.get("content") or ""
+    used_tool = any(c.get("tool_calls") for c in turn)
+    flag = ('<span class="flag">diz que fez algo sem chamar ferramenta</span>'
+            if not used_tool and CLAIM.search(reply) else "")
+    error = "".join(f'<div class="flag">erro: {html.escape(str(c["error"]))}</div>' for c in turn if c.get("error"))
+    seconds = sum(c.get("seconds") or 0 for c in turn)
+    usage = last.get("usage") or {}
+    meta = (f'{when} · {len(turn)} chamada{"s" if len(turn) > 1 else ""} · {seconds:.1f} s · '
+            f'{usage.get("prompt_tokens", "?")}→{usage.get("completion_tokens", "?")} tok')
+    if first.get("system_prompt"):
+        meta += f' · <a href="prompt/{html.escape(first["system_prompt"])}">prompt</a>'
+    raw = "".join(f'<pre>{html.escape(json.dumps(c, ensure_ascii=False, indent=2))}</pre>' for c in turn)
+    return (f'<div class="turn"><div class="meta">{meta}</div>'
+            f'<div class="msg"><b>{who}:</b> {html.escape(asked[:600])}</div>{steps}'
+            f'<div class="msg"><b>PiPA:</b> {html.escape(reply[:800])} {flag}</div>{error}'
+            f'<details><summary>tudo o que foi enviado e recebido</summary>{raw}</details></div>')
+
+
+def render(calls):
+    blocks = blocks_of(sorted(calls, key=lambda c: c.get("time", "")))
+    counts = {s: sum(1 for b in blocks if b["source"] == s) for s in SOURCES}
+    filters = "".join(f'<label class="chip src-{s}"><input type="checkbox" data-filter="{s}" checked> '
+                      f'{name} ({counts[s]})</label>' for s, name in SOURCES.items())
+    sections = []
+    for b in blocks:
+        span = f'{b["first"]:%d/%m %H:%M}'
+        if f'{b["last"]:%d/%m %H:%M}' != span:
+            span += f'–{b["last"]:%H:%M}'
+        n_calls = sum(len(t) for t in b["turns"])
+        head = (f'<span class="who">{SOURCES[b["source"]]} · {html.escape(b["label"])}</span>'
+                f'<span class="meta">{span} · {len(b["turns"])} mensage{"ns" if len(b["turns"]) > 1 else "m"}'
+                f' · {n_calls} chamada{"s" if n_calls > 1 else ""}</span>')
+        turns = "".join(render_turn(t, b["source"]) for t in b["turns"])
+        sections.append(f'<section class="block src-{b["source"]}" data-source="{b["source"]}">'
+                        f'<header>{head}</header>{turns}</section>')
+    body = "".join(sections) or "<p>Nada registrado ainda.</p>"
+    return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" '
+            f'content="width=device-width, initial-scale=1"><title>PiPA: chamadas ao modelo</title>'
+            f'<style>{PAGE_STYLE}</style></head><body><main><h1>PiPA: chamadas ao modelo</h1>'
+            f'<p class="sub">Conversas mais recentes primeiro. Cada bloco junta as mensagens de uma conversa '
+            f'sem pausa maior que {GAP.seconds // 60} minutos; cada mensagem mostra as ferramentas que o '
+            f'modelo chamou e a resposta final.</p><div class="filters">{filters}</div>{body}</main>'
+            f'<script>{PAGE_SCRIPT}</script></body></html>')
+
+
+class Page(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url = urlsplit(self.path)
+        limit = min(int((parse_qs(url.query).get("limit") or ["400"])[0]), 5000)
+        prompt = re.fullmatch(r"/prompt/([0-9a-f]{12})", url.path)
+        if url.path == "/api/calls":
+            calls = [{**c, "source": source_of(c)} for c in read_calls(limit)]
+            data, kind = json.dumps(calls, ensure_ascii=False).encode(), "application/json"
+        elif prompt and (PROMPTS / f"{prompt.group(1)}.txt").exists():
+            data, kind = (PROMPTS / f"{prompt.group(1)}.txt").read_bytes(), "text/plain; charset=utf-8"
+        elif url.path == "/":
+            data, kind = render(read_calls(limit)).encode(), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        pass
+
+
+if __name__ == "__main__":
+    page = ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), Page)
+    threading.Thread(target=page.serve_forever, daemon=True).start()
+    print(f"proxy 127.0.0.1:{PROXY_PORT} -> {UPSTREAM.geturl()} | page 127.0.0.1:{PAGE_PORT}", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy).serve_forever()

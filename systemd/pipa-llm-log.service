@@ -1,0 +1,12 @@
+[Unit]
+Description=PiPA: records nanobot's calls to the LLM (proxy 127.0.0.1:8902, page 127.0.0.1:8903)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/pipa/llm-log.env
+ExecStart=%h/.local/bin/pipa-llm-log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipa-calendar"
+version = "0.1.0"
+description = "nanobot plugin: see the events on a Google Calendar and add events to it (no editing, deleting or guests)"
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[project.entry-points."nanobot.tools"]
+calendar_events = "pipa_calendar:CalendarEventsTool"
+calendar_add_event = "pipa_calendar:CalendarAddEventTool"
+
+[tool.setuptools]
+py-modules = ["pipa_calendar"]

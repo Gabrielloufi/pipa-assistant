@@ -1,6 +1,7 @@
 [Unit]
 Description=PiPA: nanobot's API, for Home Assistant's voice (127.0.0.1:8900)
-After=network-online.target
+After=network-online.target pipa-llm-log.service
+Wants=pipa-llm-log.service
 
 [Service]
 EnvironmentFile=%h/.config/pipa/secrets.env

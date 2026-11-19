@@ -19,6 +19,9 @@ from urllib.parse import urlparse
 
 config_path, llm_url, model = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 ha_url = (sys.argv[4] if len(sys.argv) > 4 else "http://127.0.0.1:8123").rstrip("/")
+# The model's context on the server (`c` in its models.ini preset). nanobot compacts the
+# history before reaching it; a bigger number here than on the server gives errors instead.
+context = int(os.environ.get("PIPA_CONTEXT", "16384"))
 # nanobot blocks private addresses for MCP unless whitelisted: Home Assistant's own
 ha_ip = socket.gethostbyname(urlparse(ha_url).hostname)
 
@@ -36,12 +39,15 @@ SETTINGS = {
     "modelPresets": {"casa": {
         "provider": "custom",
         "model": model,
-        "contextWindowTokens": 32768,
+        "contextWindowTokens": context,
         "maxTokens": 1024,
         "temperature": 0.3,
         # No thinking out loud before answering: it only adds seconds to every reply
         "extraBody": {"chat_template_kwargs": {"enable_thinking": False}},
     }},
+    # Voice notes from chat apps: off until a local speech-to-text is set up, because
+    # nanobot's default transcription (Groq) is a cloud service
+    "transcription": {"enabled": False},
     # The API that pipa-bridge (Home Assistant's voice) talks to: this Pi only
     "api": {"host": "127.0.0.1", "port": 8900, "timeout": 300.0, "apiKey": "${PIPA_API_KEY}"},
     "tools": {
