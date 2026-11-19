@@ -24,7 +24,7 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -129,13 +129,17 @@ def summarize_request(body, channel):
     # the pipa_clock plugin names the channel in the runtime context ("Channel: telegram"),
     # which also tells a reminder firing in the gateway apart from a chat message
     users = [text_of(m.get("content")) for m in messages if m.get("role") == "user"]
-    named = re.search(r"^Channel: ([\w-]+)$", users[-1] if users else "", re.M)
+    newest = users[-1] if users else ""
+    named = re.search(r"^Channel: ([\w-]+)$", newest, re.M)
     if named:
         channel = {"api": "voz", "cli": "terminal"}.get(named.group(1), named.group(1))
+    session = re.search(r"^Session: (\S+)$", newest, re.M)  # also from pipa_clock
     return {
         "model": body.get("model"),
         "stream": bool(body.get("stream")),
         "channel": channel,
+        "turn": bool(named),  # a message from a chat; without it, nanobot's own work (Dream...)
+        "session": session.group(1) if session else None,
         "user": newest_user_text(messages),
         "after_tool": last.get("role") == "tool",  # a follow-up call, with a tool's result
         "n_messages": len(messages),
@@ -269,62 +273,182 @@ def read_calls(limit):
 
 PAGE_STYLE = """
 :root { color-scheme: light dark; --bg: #f4f4f6; --card: #fff; --text: #1d1d22; --muted: #6b6b75;
-        --tool: #1f6feb; --warn: #b42318; --ok: #1a7f37; }
+        --tool: #1f6feb; --warn: #b42318;
+        --you-bg: #e8f0ff; --you-line: #2f6fdb; --claude-bg: #fff2dc; --claude-line: #c27803;
+        --pipa-bg: #efecf6; --pipa-line: #7b68b5; }
 @media (prefers-color-scheme: dark) { :root { --bg: #18181b; --card: #232327; --text: #ececf1;
-        --muted: #a0a0aa; --tool: #6ea8fe; --warn: #ff7b72; --ok: #56d364; } }
+        --muted: #a0a0aa; --tool: #79aaff; --warn: #ff7b72;
+        --you-bg: #16233a; --you-line: #4c8dff; --claude-bg: #2a2012; --claude-line: #e0a030;
+        --pipa-bg: #221f2d; --pipa-line: #9c8ad8; } }
 body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, sans-serif; }
 main { max-width: 980px; margin: 0 auto; }
-h1 { font-size: 20px; margin: 0 0 4px; } p.sub { color: var(--muted); margin: 0 0 16px; }
-details { background: var(--card); border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }
-summary { cursor: pointer; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
-.meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
-.who { font-weight: 600; } .user { flex: 1 1 100%; }
-.tool { color: var(--tool); font-family: ui-monospace, monospace; font-size: 13px; }
-.flag { color: var(--warn); font-weight: 600; } .ok { color: var(--ok); }
+h1 { font-size: 20px; margin: 0 0 4px; } p.sub { color: var(--muted); margin: 0 0 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip { border-radius: 999px; padding: 4px 12px; cursor: pointer; border-left: 4px solid; font-size: 14px; }
+.block { border-radius: 10px; border-left: 5px solid; padding: 10px 14px; margin-bottom: 12px; }
+.src-you { background: var(--you-bg); border-color: var(--you-line); }
+.src-claude { background: var(--claude-bg); border-color: var(--claude-line); }
+.src-pipa { background: var(--pipa-bg); border-color: var(--pipa-line); }
+header { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 6px; }
+.who { font-weight: 600; }
+.meta { color: var(--muted); font-size: 13px; }
+.turn { background: var(--card); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+.msg { margin: 4px 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+a { color: var(--tool); }
+.step { margin: 2px 0 2px 12px; }
+.tool { color: var(--tool); font-family: ui-monospace, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.flag { color: var(--warn); font-weight: 600; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 4px; }
 pre { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; background: rgba(127,127,127,.12);
       padding: 8px; border-radius: 6px; margin: 8px 0 0; }
 """
+PAGE_SCRIPT = """
+const KEY = 'pipa-log-hidden';
+let hidden = [];
+try { hidden = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) {}
+const boxes = [...document.querySelectorAll('input[data-filter]')];
+function apply() {
+  hidden = boxes.filter(b => !b.checked).map(b => b.dataset.filter);
+  try { localStorage.setItem(KEY, JSON.stringify(hidden)); } catch (e) {}
+  document.querySelectorAll('section.block').forEach(s => { s.hidden = hidden.includes(s.dataset.source); });
+}
+boxes.forEach(b => { b.checked = !hidden.includes(b.dataset.filter); b.addEventListener('change', apply); });
+apply();
+"""
+GAP = timedelta(minutes=15)  # a longer pause starts a new block
+# Claude's test conversations are named "teste-..." (through the bridge or the API) or
+# "bench-..." (pipa-gabe/bench); nanobot's own prompts are recognized by their wording.
+TEST_SESSION = re.compile(r"(^|[:_-])(teste|bench)", re.I)
+INTERNAL = [("Dream (memória de longo prazo)", re.compile(r"You are running Dream", re.I)),
+            ("resumo da conversa", re.compile(r"compact replacement checkpoint|retained fact|summar", re.I))]
+SOURCES = {"you": "Você", "claude": "Claude (testes)", "pipa": "PiPA (por conta própria)"}
 CLAIM = re.compile(r"\b(agendei|anotei|liguei|desliguei|criei|marquei|lembrete criado)\b", re.I)
 
 
-def render(calls):
-    rows = []
+def last_user_text(c):
+    for m in reversed(c.get("messages_tail") or []):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return c.get("user") or ""
+
+
+def internal_kind(c):
+    text = last_user_text(c)
+    return next((kind for kind, pattern in INTERNAL if pattern.search(text)), None)
+
+
+def source_of(c):
+    """Who started a call: you (Telegram, or Home Assistant's voice later), Claude testing
+    PiPA, or PiPA on its own (Dream, memory, a reminder firing)."""
+    session = c.get("session") or ""
+    turn = c.get("turn")
+    if turn is None:  # logged before "turn" was recorded
+        turn = "Channel:" in last_user_text(c)
+    if c.get("channel") in ("terminal", "teste", "?") or TEST_SESSION.search(session):
+        return "claude"
+    if internal_kind(c) or session.startswith(("cron", "heartbeat", "dream", "system")):
+        return "pipa"
+    if c.get("channel") == "voz" and not session:  # before sessions were logged, only Claude used voice
+        return "claude"
+    return "you" if turn else "pipa"
+
+
+def label_of(c, source):
+    if source == "pipa":
+        session = c.get("session") or ""
+        return internal_kind(c) or ("lembrete" if session.startswith("cron") else "tarefa")
+    return {"telegram": "Telegram", "voz": "voz", "terminal": "terminal", "?": "API"}.get(
+        c.get("channel"), str(c.get("channel")))
+
+
+def blocks_of(calls):
+    """Calls, oldest first, gathered into conversation blocks: same source and conversation,
+    no pause over GAP. Each block holds turns: a message and the calls it caused."""
+    open_blocks, blocks = {}, []
     for c in calls:
-        tools = c.get("tool_calls") or []
-        did = " ".join(f'<span class="tool">→ {html.escape(t.get("name") or "?")}({html.escape((t.get("arguments") or "")[:120])})</span>'
-                       for t in tools)
-        reply = c.get("content") or ""
-        claims_without_tool = not tools and not c.get("after_tool") and CLAIM.search(reply)
-        flag = '<span class="flag">says it did something, with no tool call</span>' if claims_without_tool else ""
-        offered = c.get("tools") or []
-        usage = c.get("usage") or {}
-        meta = (f'{html.escape(c.get("time", ""))} · {html.escape(str(c.get("channel")))} · {html.escape(str(c.get("model")))}'
-                f' · {c.get("seconds", "?")} s · {usage.get("prompt_tokens", "?")}→{usage.get("completion_tokens", "?")} tok'
-                f' · {len(offered)} tools{" (cron)" if "cron" in offered else ""}')
-        if c.get("system_prompt"):
-            meta += f' · <a href="prompt/{html.escape(c["system_prompt"])}">prompt</a>'
-        user = "(continues after a tool result)" if c.get("after_tool") else c.get("user", "")
-        rows.append(
-            f'<details><summary><span class="meta">{meta}</span>'
-            f'<span class="user"><span class="who">Você:</span> {html.escape(user[:300])}</span>'
-            f'<span class="user"><span class="who">Modelo:</span> {did} {html.escape(reply[:300])} {flag}</span></summary>'
-            f'<pre>{html.escape(json.dumps(c, ensure_ascii=False, indent=2))}</pre></details>')
-    body = "".join(rows) or "<p>Nada registrado ainda.</p>"
+        source = source_of(c)
+        label = label_of(c, source)
+        key = (source, c.get("session") or label)
+        when = datetime.fromisoformat(c["time"])
+        block = open_blocks.get(key)
+        if block is None or when - block["last"] > GAP:
+            block = {"source": source, "label": label, "first": when, "turns": []}
+            open_blocks[key] = block
+            blocks.append(block)
+        block["last"] = when
+        if c.get("after_tool") and block["turns"]:
+            block["turns"][-1].append(c)
+        else:
+            block["turns"].append([c])
+    return sorted(blocks, key=lambda b: b["last"], reverse=True)
+
+
+def tool_line(t):
+    return (f'<div class="step">→ <span class="tool">{html.escape(t.get("name") or "?")}'
+            f'({html.escape((t.get("arguments") or "")[:160])})</span></div>')
+
+
+def render_turn(turn, source):
+    first, last = turn[0], turn[-1]
+    when = datetime.fromisoformat(first["time"]).strftime("%H:%M:%S")
+    asked = first.get("user") or ""
+    if source == "pipa":
+        asked = asked[:160] + ("…" if len(asked) > 160 else "")
+    who = {"you": "Você", "claude": "Claude", "pipa": "Tarefa"}[source]
+    steps = "".join(tool_line(t) for c in turn for t in c.get("tool_calls") or [])
+    reply = last.get("content") or ""
+    used_tool = any(c.get("tool_calls") for c in turn)
+    flag = ('<span class="flag">diz que fez algo sem chamar ferramenta</span>'
+            if not used_tool and CLAIM.search(reply) else "")
+    error = "".join(f'<div class="flag">erro: {html.escape(str(c["error"]))}</div>' for c in turn if c.get("error"))
+    seconds = sum(c.get("seconds") or 0 for c in turn)
+    usage = last.get("usage") or {}
+    meta = (f'{when} · {len(turn)} chamada{"s" if len(turn) > 1 else ""} · {seconds:.1f} s · '
+            f'{usage.get("prompt_tokens", "?")}→{usage.get("completion_tokens", "?")} tok')
+    if first.get("system_prompt"):
+        meta += f' · <a href="prompt/{html.escape(first["system_prompt"])}">prompt</a>'
+    raw = "".join(f'<pre>{html.escape(json.dumps(c, ensure_ascii=False, indent=2))}</pre>' for c in turn)
+    return (f'<div class="turn"><div class="meta">{meta}</div>'
+            f'<div class="msg"><b>{who}:</b> {html.escape(asked[:600])}</div>{steps}'
+            f'<div class="msg"><b>PiPA:</b> {html.escape(reply[:800])} {flag}</div>{error}'
+            f'<details><summary>tudo o que foi enviado e recebido</summary>{raw}</details></div>')
+
+
+def render(calls):
+    blocks = blocks_of(sorted(calls, key=lambda c: c.get("time", "")))
+    counts = {s: sum(1 for b in blocks if b["source"] == s) for s in SOURCES}
+    filters = "".join(f'<label class="chip src-{s}"><input type="checkbox" data-filter="{s}" checked> '
+                      f'{name} ({counts[s]})</label>' for s, name in SOURCES.items())
+    sections = []
+    for b in blocks:
+        span = f'{b["first"]:%d/%m %H:%M}'
+        if f'{b["last"]:%d/%m %H:%M}' != span:
+            span += f'–{b["last"]:%H:%M}'
+        n_calls = sum(len(t) for t in b["turns"])
+        head = (f'<span class="who">{SOURCES[b["source"]]} · {html.escape(b["label"])}</span>'
+                f'<span class="meta">{span} · {len(b["turns"])} mensage{"ns" if len(b["turns"]) > 1 else "m"}'
+                f' · {n_calls} chamada{"s" if n_calls > 1 else ""}</span>')
+        turns = "".join(render_turn(t, b["source"]) for t in b["turns"])
+        sections.append(f'<section class="block src-{b["source"]}" data-source="{b["source"]}">'
+                        f'<header>{head}</header>{turns}</section>')
+    body = "".join(sections) or "<p>Nada registrado ainda.</p>"
     return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" '
             f'content="width=device-width, initial-scale=1"><title>PiPA: chamadas ao modelo</title>'
             f'<style>{PAGE_STYLE}</style></head><body><main><h1>PiPA: chamadas ao modelo</h1>'
-            f'<p class="sub">As mais recentes primeiro. Cada linha é uma chamada ao modelo de linguagem; '
-            f'uma mensagem sua pode gerar várias (ferramenta, depois resposta). Clique para ver tudo.</p>'
-            f'{body}</main></body></html>')
+            f'<p class="sub">Conversas mais recentes primeiro. Cada bloco junta as mensagens de uma conversa '
+            f'sem pausa maior que {GAP.seconds // 60} minutos; cada mensagem mostra as ferramentas que o '
+            f'modelo chamou e a resposta final.</p><div class="filters">{filters}</div>{body}</main>'
+            f'<script>{PAGE_SCRIPT}</script></body></html>')
 
 
 class Page(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlsplit(self.path)
-        limit = min(int((parse_qs(url.query).get("limit") or ["100"])[0]), 2000)
+        limit = min(int((parse_qs(url.query).get("limit") or ["400"])[0]), 5000)
         prompt = re.fullmatch(r"/prompt/([0-9a-f]{12})", url.path)
         if url.path == "/api/calls":
-            data, kind = json.dumps(read_calls(limit), ensure_ascii=False).encode(), "application/json"
+            calls = [{**c, "source": source_of(c)} for c in read_calls(limit)]
+            data, kind = json.dumps(calls, ensure_ascii=False).encode(), "application/json"
         elif prompt and (PROMPTS / f"{prompt.group(1)}.txt").exists():
             data, kind = (PROMPTS / f"{prompt.group(1)}.txt").read_bytes(), "text/plain; charset=utf-8"
         elif url.path == "/":

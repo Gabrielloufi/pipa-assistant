@@ -66,6 +66,8 @@ class ClockTool(Tool):
             lines = [now_line(self._timezone)]
             if getattr(request, "channel", None):
                 lines.append(f"Channel: {request.channel}")
+            if getattr(request, "session_key", None):  # lets pipa-llm-log group a conversation's calls
+                lines.append(f"Session: {request.session_key}")
             return RuntimeContextBlock(source="pipa_clock", content=wrap_runtime_context_lines(lines))
         return provide
 

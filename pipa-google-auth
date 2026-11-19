@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Authorizes PiPA to use your Google Calendar. Run it once, on a computer with a browser.
+
+  pipa-google-auth CLIENT_JSON OUT_FILE [--port 8766]
+
+CLIENT_JSON is the "Desktop app" OAuth client downloaded from Google Cloud (see README.md).
+It prints a link: open it in the browser on the same computer, choose your account and allow
+access to your calendar. Google then sends the browser back to this script, on
+http://127.0.0.1:PORT, and the script writes GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and
+GOOGLE_REFRESH_TOKEN to OUT_FILE (readable only by you), to be added to PiPA's secrets.env.
+It never prints the token.
+
+The access asked for is calendar.events.owned: see, create, change and delete events on
+calendars you own. PiPA's tools only read and add; nothing else in your Google account.
+Revoke it at any time: myaccount.google.com > Security > third-party apps and services.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import secrets
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+SCOPE = "https://www.googleapis.com/auth/calendar.events.owned"
+WAIT_S = 900
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("client_json")
+    parser.add_argument("out_file")
+    parser.add_argument("--port", type=int, default=8766)
+    args = parser.parse_args()
+    client_json, out_file, port = args.client_json, args.out_file, args.port
+    client = json.load(open(client_json))
+    client = client.get("installed") or client.get("web") or {}
+    if not client.get("client_id"):
+        sys.exit(f"{client_json} isn't an OAuth client file from Google Cloud")
+
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    redirect = f"http://127.0.0.1:{port}/"
+    link = client.get("auth_uri", "https://accounts.google.com/o/oauth2/auth") + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": SCOPE, "access_type": "offline", "prompt": "consent", "state": state,
+        "code_challenge": challenge, "code_challenge_method": "S256"})
+
+    result = {}
+
+    class Callback(BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if query.get("state", [""])[0] != state:
+                self.send_error(400, "Unexpected request")
+                return
+            result.update({k: v[0] for k, v in query.items()})
+            ok = "code" in result
+            page = ("Pronto: a PiPA tem acesso à sua agenda. Pode fechar esta aba." if ok else
+                    f"O Google não autorizou: {result.get('error', '?')}. Pode fechar esta aba.")
+            body = f"<!doctype html><meta charset=utf-8><p style='font:18px sans-serif'>{page}</p>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", port), Callback)
+    server.timeout = WAIT_S
+    print(f"Open this link in your browser:\n\n{link}\n\nWaiting up to {WAIT_S // 60} minutes...", flush=True)
+    while not result:
+        server.handle_request()
+        if not result:
+            sys.exit("No answer from the browser in time; run again.")
+    if "code" not in result:
+        sys.exit(f"Google didn't authorize: {result.get('error')}")
+
+    data = urllib.parse.urlencode({
+        "client_id": client["client_id"], "client_secret": client.get("client_secret", ""),
+        "code": result["code"], "code_verifier": verifier, "grant_type": "authorization_code",
+        "redirect_uri": redirect}).encode()
+    token_uri = client.get("token_uri", "https://oauth2.googleapis.com/token")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(token_uri, data), timeout=30) as response:
+            tokens = json.load(response)
+    except urllib.error.HTTPError as err:
+        sys.exit(f"Google refused the code: {err.read().decode()[:300]}")
+    if SCOPE not in tokens.get("scope", "").split():
+        sys.exit("Calendar access wasn't granted (its box was unchecked on Google's page); run again "
+                 "and leave it checked.")
+    if not tokens.get("refresh_token"):
+        sys.exit("Google sent no refresh token; remove PiPA's access in your Google account and run again.")
+
+    fd = os.open(out_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as out:
+        out.write(f"GOOGLE_CLIENT_ID={client['client_id']}\n"
+                  f"GOOGLE_CLIENT_SECRET={client.get('client_secret', '')}\n"
+                  f"GOOGLE_REFRESH_TOKEN={tokens['refresh_token']}\n")
+    print(f"Done: written to {out_file}. Add those three lines to ~/.config/pipa/secrets.env on "
+          "the Pi and run install.sh again.")
+
+
+if __name__ == "__main__":
+    main()

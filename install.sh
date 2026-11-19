@@ -55,8 +55,11 @@ if [ "$("$VENV/bin/nanobot" --version 2>/dev/null | grep -o '[0-9.]*$')" != "$NA
     "$VENV/bin/pip" install -q "nanobot-ai==$NANOBOT_VERSION"
 fi
 "$VENV/bin/nanobot" --version
-# nanobot doesn't tell the model the time; this plugin does, on every turn (see pipa_clock.py)
-"$VENV/bin/pip" install -q --no-deps --force-reinstall "$HERE/pipa_clock"
+# PiPA's nanobot plugins: the time on every turn (nanobot doesn't give it), and Google
+# Calendar (its tools load only once its authorization is in the secrets)
+for plugin in pipa_clock pipa_calendar; do
+    "$VENV/bin/pip" install -q --no-deps --force-reinstall "$HERE/$plugin"
+done
 
 echo "== Secrets ($SECRETS)"
 if [ ! -f "$SECRETS" ]; then
@@ -71,6 +74,10 @@ HA_TOKEN=
 # Telegram: the bot's token from @BotFather, and your numeric user ID (from @userinfobot)
 TELEGRAM_TOKEN=
 TELEGRAM_ALLOW_FROM=
+# Google Calendar: the three lines pipa-google-auth writes (see README.md)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REFRESH_TOKEN=
 EOF
 fi
 set -a
@@ -79,6 +86,7 @@ source "$SECRETS"
 set +a
 [ -n "${HA_TOKEN:-}" ] || NOTES+=("No HA_TOKEN in $SECRETS yet: PiPA can't see or control the house.")
 [ -n "${TELEGRAM_TOKEN:-}" ] || NOTES+=("No TELEGRAM_TOKEN in $SECRETS yet: no Telegram.")
+[ -n "${GOOGLE_REFRESH_TOKEN:-}" ] || NOTES+=("No Google Calendar yet (optional): see README.md, Google Calendar.")
 
 echo "== Settings ($CONFIG)"
 [ -f "$CONFIG" ] || "$VENV/bin/nanobot" onboard < /dev/null > /dev/null
@@ -97,6 +105,7 @@ fi
 echo "== Services"
 install -D -m 755 "$HERE/pipa-bridge" "$HOME/.local/bin/pipa-bridge"
 install -D -m 755 "$HERE/pipa-llm-log" "$HOME/.local/bin/pipa-llm-log"
+install -D -m 755 "$HERE/pipa-google-auth" "$HOME/.local/bin/pipa-google-auth"
 printf "PIPA_LLM_UPSTREAM=%s\n" "$LLM_URL" > "$HOME/.config/pipa/llm-log.env"
 mkdir -p "$UNITS"
 for unit in pipa-llm-log pipa-api pipa-gateway pipa-bridge; do

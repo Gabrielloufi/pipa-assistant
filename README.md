@@ -33,6 +33,8 @@ Telegram ─> nanobot gateway ─┘
 | `pipa-bridge` | `~/.local/bin/pipa-bridge` | Home Assistant's OpenAI-style requests to nanobot's API, and back. |
 | `pipa-llm-log` | `~/.local/bin/pipa-llm-log` | Passes nanobot's calls to the LLM server and records them, for a page that shows what PiPA asked and what the model answered. |
 | `pipa_clock/` | nanobot's environment | A nanobot plugin: gives the model the current time and the channel on every turn. |
+| `pipa_calendar/` | nanobot's environment | A nanobot plugin: reads your Google Calendar and adds events to it, once authorized. |
+| `pipa-google-auth` | `~/.local/bin/pipa-google-auth` | Authorizes PiPA to use your Google Calendar, once, from a computer with a browser. |
 | `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, the bridge and the call log, as user services. |
 | | `~/.local/share/pipa/venv` | nanobot 0.4.1. |
 | | `~/.config/pipa/secrets.env` | Tokens, readable only by you. Created by the first run. |
@@ -80,6 +82,38 @@ Put the tokens in `~/.config/pipa/secrets.env` (`nano ~/.config/pipa/secrets.env
 - `TELEGRAM_TOKEN` and `TELEGRAM_ALLOW_FROM`: create a bot with @BotFather; your numeric
   Telegram user ID comes from @userinfobot. Only that ID can talk to the bot.
 
+### Google Calendar
+
+PiPA can read your Google Calendar and add events to it, through two tools:
+`calendar_events` (the events in a period) and `calendar_add_event` (one event, no guests).
+
+- **What PiPA can't do:** edit or delete events, or invite anyone. Google would e-mail the
+  guests in your name.
+- **Other people's invites:** events organized by someone else reach the model without their
+  description, since anyone can send you an invite with text meant for the model.
+
+The authorization is your own Google Cloud app. It's free and takes a few minutes, once.
+
+1. At [console.cloud.google.com](https://console.cloud.google.com), create a project.
+2. In **APIs & Services > Library**, enable the **Google Calendar API**.
+3. In **Google Auth Platform**, set it up:
+   - app name, your e-mail, audience **External**;
+   - in **Data access**, add the scope `https://www.googleapis.com/auth/calendar.events.owned`
+     (events on calendars you own, nothing else);
+   - in **Audience**, **Publish app**. While it is "Testing", Google expires the
+     authorization every 7 days. It doesn't need Google's verification for your own use.
+4. In **Clients**, create one of type **Desktop app** and download its JSON.
+5. On a computer with a browser, with that JSON and a clone of this repository:
+   ```bash
+   ./pipa-google-auth client_secret_XXXX.json google.env
+   ```
+   Open the link it prints, choose your account, and allow access. Google warns that the app
+   isn't verified: it's yours, so choose Advanced > continue.
+6. Add the three lines of `google.env` to `~/.config/pipa/secrets.env` on the Pi, delete
+   `google.env`, and run `./install.sh` again.
+
+To revoke the access, go to your Google account > Security > third-party apps and services.
+
 ## In Home Assistant
 
 1. Settings → Devices & services → Add integration → **llama.cpp**: URL
@@ -113,6 +147,16 @@ LLM server, passes everything through unchanged (streaming too), and keeps a log
 channel (Telegram, voz), your message, the tools offered, what the model called with which
 arguments, its reply, tokens and time. A reply that claims an action without a tool call is
 flagged in red.
+
+The page gathers the calls of one conversation into a block, until a pause of 15 minutes, and
+each of your messages shows the tool calls it led to and the final reply. Blocks are coloured
+by who started them:
+- **you:** Telegram, or Home Assistant's voice;
+- **a test:** conversations named `teste-…` or `bench-…`, or nanobot run from a terminal;
+- **PiPA on its own:** Dream, conversation summaries, reminders firing.
+
+Checkboxes hide any of the three. `pipa_clock` puts the channel and the conversation in each
+message's runtime context, which is how the log tells them apart.
 
 The page is at `http://127.0.0.1:8903/` on the Pi, and the installer also serves it on your
 tailnet at `https://<pi>.<tailnet>.ts.net:8444/`; `/api/calls?limit=N` gives the same as JSON.
