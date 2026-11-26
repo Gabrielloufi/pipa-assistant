@@ -1,0 +1,12 @@
+[Unit]
+Description=PiPA: speech to text for voice notes (127.0.0.1:8904 -> a Wyoming server such as Whisper)
+After=network-online.target
+
+[Service]
+EnvironmentFile=%h/.config/pipa/stt.env
+ExecStart=%h/.local/share/pipa/venv/bin/python %h/.local/bin/pipa-stt
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -8,6 +8,9 @@ from ~/.config/pipa/secrets.env. nanobot refuses to start when a referenced vari
 unset, so Home Assistant and Telegram are only added once their tokens are in that file.
 
   configure.py CONFIG_JSON LLM_URL MODEL [HA_URL]
+
+PIPA_STT set (by install.sh, when pipa.conf has STT_URL) turns on voice-note transcription
+through pipa-stt on 127.0.0.1:8904.
 """
 
 import json
@@ -45,9 +48,6 @@ SETTINGS = {
         # No thinking out loud before answering: it only adds seconds to every reply
         "extraBody": {"chat_template_kwargs": {"enable_thinking": False}},
     }},
-    # Voice notes from chat apps: off until a local speech-to-text is set up, because
-    # nanobot's default transcription (Groq) is a cloud service
-    "transcription": {"enabled": False},
     # The API that pipa-bridge (Home Assistant's voice) talks to: this Pi only
     "api": {"host": "127.0.0.1", "port": 8900, "timeout": 300.0, "apiKey": "${PIPA_API_KEY}"},
     "tools": {
@@ -59,9 +59,12 @@ SETTINGS = {
     },
 }
 
+# Home Assistant's MCP Server, Assist API only: its main URL (/api/mcp) can also serve admin
+# tool sets (run any action, reload integrations, read logs), while /api/mcp/assist serves just
+# the exposed entities and is the one set a non-admin user's token may use.
 HOME_ASSISTANT = {"tools": {"mcpServers": {"homeassistant": {
     "type": "streamableHttp",
-    "url": f"{ha_url}/api/mcp",
+    "url": f"{ha_url}/api/mcp/assist",
     "headers": {"Authorization": "Bearer ${HA_TOKEN}"},
     "toolTimeout": 60,
 }}}}
@@ -85,8 +88,20 @@ def merge(base, extra):
     return base
 
 
+# Voice notes from chat apps: through pipa-stt, which asks your own Whisper; otherwise off,
+# because nanobot's default transcription (Groq) is a cloud service
+LOCAL_STT = {
+    "transcription": {"enabled": True, "provider": "openai", "language": "pt"},
+    # nanobot's OpenAI-style transcription client, pointed at pipa-stt (it wants a key; any will do)
+    "providers": {"openai": {"apiBase": "http://127.0.0.1:8904/v1", "apiKey": "local"}},
+}
+
 config = json.loads(config_path.read_text())
 merge(config, SETTINGS)
+if os.environ.get("PIPA_STT"):
+    merge(config, LOCAL_STT)
+else:
+    config["transcription"] = {"enabled": False}
 if os.environ.get("HA_TOKEN"):
     merge(config, HOME_ASSISTANT)
 else:
@@ -101,4 +116,5 @@ if not backup.exists():
     backup.write_text(config_path.read_text())
 config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
 print("nanobot config:", "Home Assistant" if os.environ.get("HA_TOKEN") else "no Home Assistant yet",
-      "|", "Telegram" if os.environ.get("TELEGRAM_TOKEN") else "no Telegram yet")
+      "|", "Telegram" if os.environ.get("TELEGRAM_TOKEN") else "no Telegram yet",
+      "|", "voice notes via pipa-stt" if os.environ.get("PIPA_STT") else "no voice notes")
