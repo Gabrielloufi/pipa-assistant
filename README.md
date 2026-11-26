@@ -34,6 +34,8 @@ Telegram ─> nanobot gateway ─┘
 | `pipa-llm-log` | `~/.local/bin/pipa-llm-log` | Passes nanobot's calls to the LLM server and records them, for a page that shows what PiPA asked and what the model answered. |
 | `pipa_clock/` | nanobot's environment | A nanobot plugin: gives the model the current time and the channel on every turn. |
 | `pipa_calendar/` | nanobot's environment | A nanobot plugin: reads your Google Calendar and adds events to it, once authorized. |
+| `pipa_links/` | nanobot's environment | A nanobot plugin: reads a link you send, summarizes and tags it, and finds it again later. |
+| `pipa-stt` | `~/.local/bin/pipa-stt` | Speech to text for voice notes: an OpenAI-style endpoint that asks your own Wyoming server (Whisper). |
 | `pipa-google-auth` | `~/.local/bin/pipa-google-auth` | Authorizes PiPA to use your Google Calendar, once, from a computer with a browser. |
 | `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, the bridge and the call log, as user services. |
 | | `~/.local/share/pipa/venv` | nanobot 0.4.1. |
@@ -114,6 +116,41 @@ The authorization is your own Google Cloud app. It's free and takes a few minute
 
 To revoke the access, go to your Google account > Security > third-party apps and services.
 
+### Voice notes
+
+nanobot transcribes Telegram voice notes by sending them to an OpenAI-style
+`/audio/transcriptions` endpoint, a cloud service by default. With `STT_URL` in `pipa.conf`
+pointing at a Wyoming speech-to-text server (for example wyoming-faster-whisper on a PC with
+a GPU, the one Home Assistant's voice uses), the installer starts `pipa-stt` on
+127.0.0.1:8904 and points nanobot at it.
+
+- It converts the audio with ffmpeg and asks your server for the text. Nothing runs on the Pi
+  itself.
+- Measured with Whisper large-v3-turbo on an RTX 4070 SUPER: 0.6–0.7 s for a 7 s voice note,
+  about 5 s while the model loads.
+- If the server is off, the message arrives without a transcription, and PiPA says it couldn't
+  hear it.
+- Leave `STT_URL` empty to keep voice notes off.
+
+### Links
+
+Send PiPA a link, alone or with a comment, and it goes into a catalog: a title, a summary of 2
+or 3 sentences in Portuguese, a kind (article, news, video, repository, documentation, tool,
+PDF, post) and 1 to 4 tags. Ask later for "os links sobre python" or "os vídeos que eu salvei"
+and it finds them, by tag, by words (accents don't matter) or by kind.
+
+- `link_add` reads the page on the Pi itself, not through nanobot's default cloud reader
+  (Jina): web pages through readability, PDFs through pypdf, the first 12,000 characters.
+- A separate call to the model writes the summary and picks the tags, reusing the ones in
+  use. The page's text never enters the conversation, whose context is small, and links are
+  stripped from the summary.
+- Addresses inside the house or the tailnet are refused, at every redirect.
+- Sending the same link again updates it. Tracking parameters (`utm_*`, `fbclid`...) are
+  dropped first.
+
+The catalog is `~/.local/state/pipa/links.sqlite3`, shown as a table on the model-call page's
+**Links salvos** (`/links`), with tags and search.
+
 ## In Home Assistant
 
 1. Settings → Devices & services → Add integration → **llama.cpp**: URL
@@ -162,6 +199,25 @@ The page is at `http://127.0.0.1:8903/` on the Pi, and the installer also serves
 tailnet at `https://<pi>.<tailnet>.ts.net:8444/`; `/api/calls?limit=N` gives the same as JSON.
 The log, `~/.local/state/pipa/llm-calls.jsonl`, holds your conversations: it stays on the Pi
 and is kept under 20 MB. `PIPA_LLM_LOG=0` in `pipa.conf` turns it off.
+
+## Stopping PiPA: "pare"
+
+Send just **pare** on Telegram, or say it by voice, and PiPA pauses. Every call it
+makes to the model gets a fixed reply from `pipa-llm-log` instead, so no tool runs: nothing
+in the house, no reminder, no link. A task that was running stops at its next step.
+
+- **despausar** ends the pause. These are plain words on purpose: nanobot's Telegram channel
+  silently drops any `/command` it doesn't know.
+- The pause is a file, `~/.local/state/pipa/pausada`, so it survives restarts, and the
+  model-call page shows it.
+- nanobot's own **`/stop`** cancels the running task at once, without pausing.
+
+## Tool schemas from Home Assistant
+
+Home Assistant describes some numbers as an `allOf` of two types (a fan's percentage is
+"integer" and "number from 0 to 100"). llama.cpp turns that into a grammar that only allows
+`{}`, so the model could never set a fan's speed. `pipa-llm-log` merges such `allOf`s into one
+type before the request reaches the server.
 
 ## The time, and the first message after a restart
 

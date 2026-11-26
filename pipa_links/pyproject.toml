@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipa-links"
+version = "0.1.0"
+description = "nanobot plugin: read a link, summarize it, keep it in a tagged catalog, find it again"
+requires-python = ">=3.11"
+dependencies = ["httpx", "readability-lxml", "lxml", "pypdf"]
+
+[project.entry-points."nanobot.tools"]
+link_add = "pipa_links:LinkAddTool"
+link_search = "pipa_links:LinkSearchTool"
+
+[tool.setuptools]
+py-modules = ["pipa_links"]

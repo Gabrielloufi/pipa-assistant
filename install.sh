@@ -42,6 +42,9 @@ LLM_URL="${LLM_URL:?set LLM_URL in $CONF}"
 MODEL="${PIPA_MODEL:?set PIPA_MODEL in $CONF}"
 HA_URL="${HA_URL:-http://127.0.0.1:8123}"
 export PIPA_CONTEXT="${PIPA_CONTEXT:-16384}"
+# Voice notes: a Wyoming speech-to-text server (Whisper on a PC, for example); empty = off
+STT_URL="${STT_URL:-}"
+export PIPA_STT="${STT_URL:+1}"
 # nanobot reaches the LLM through pipa-llm-log, which records each call for its page;
 # PIPA_LLM_LOG=0 in the settings connects it straight to the server instead
 if [ "${PIPA_LLM_LOG:-1}" != 0 ]; then NANOBOT_LLM=http://127.0.0.1:8902/v1; else NANOBOT_LLM=$LLM_URL; fi
@@ -55,11 +58,14 @@ if [ "$("$VENV/bin/nanobot" --version 2>/dev/null | grep -o '[0-9.]*$')" != "$NA
     "$VENV/bin/pip" install -q "nanobot-ai==$NANOBOT_VERSION"
 fi
 "$VENV/bin/nanobot" --version
-# PiPA's nanobot plugins: the time on every turn (nanobot doesn't give it), and Google
-# Calendar (its tools load only once its authorization is in the secrets)
-for plugin in pipa_clock pipa_calendar; do
+# PiPA's nanobot plugins: the time on every turn (nanobot doesn't give it), Google
+# Calendar (its tools load only once its authorization is in the secrets), and the link
+# catalog
+for plugin in pipa_clock pipa_calendar pipa_links; do
     "$VENV/bin/pip" install -q --no-deps --force-reinstall "$HERE/$plugin"
 done
+# pipa-stt talks Wyoming to the speech-to-text server
+"$VENV/bin/pip" install -q wyoming
 
 echo "== Secrets ($SECRETS)"
 if [ ! -f "$SECRETS" ]; then
@@ -106,20 +112,29 @@ echo "== Services"
 install -D -m 755 "$HERE/pipa-bridge" "$HOME/.local/bin/pipa-bridge"
 install -D -m 755 "$HERE/pipa-llm-log" "$HOME/.local/bin/pipa-llm-log"
 install -D -m 755 "$HERE/pipa-google-auth" "$HOME/.local/bin/pipa-google-auth"
+install -D -m 755 "$HERE/pipa-stt" "$HOME/.local/bin/pipa-stt"
 printf "PIPA_LLM_UPSTREAM=%s\n" "$LLM_URL" > "$HOME/.config/pipa/llm-log.env"
+printf "PIPA_STT_WYOMING=%s\n" "$STT_URL" > "$HOME/.config/pipa/stt.env"
+UNIT_LIST="pipa-llm-log pipa-api pipa-gateway pipa-bridge"
+if [ -n "$STT_URL" ]; then
+    UNIT_LIST="pipa-stt $UNIT_LIST"
+else
+    systemctl --user disable --now pipa-stt > /dev/null 2>&1 || true
+    NOTES+=("No STT_URL in $CONF: voice notes aren't transcribed.")
+fi
 mkdir -p "$UNITS"
-for unit in pipa-llm-log pipa-api pipa-gateway pipa-bridge; do
+for unit in pipa-llm-log pipa-api pipa-gateway pipa-bridge pipa-stt; do
     install -m 644 "$HERE/systemd/$unit.service" "$UNITS/$unit.service"
 done
 # User services; lingering starts them at boot, whether or not the desktop logs in
 sudo loginctl enable-linger "$USER"
 systemctl --user daemon-reload
-for unit in pipa-llm-log pipa-api pipa-gateway pipa-bridge; do
+for unit in $UNIT_LIST; do
     systemctl --user enable "$unit" > /dev/null 2>&1
     systemctl --user restart "$unit"
 done
 sleep 5
-systemctl --user --no-pager --plain list-units 'pipa-*' | head -6
+systemctl --user --no-pager --plain list-units 'pipa-*' | head -7
 # The page of model calls, for your tailnet only (not Funnel), with the Pi's HTTPS certificate
 if command -v tailscale > /dev/null && sudo tailscale serve --bg --https=8444 http://127.0.0.1:8903 > /dev/null; then
     host=$(tailscale status --json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')

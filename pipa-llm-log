@@ -13,6 +13,17 @@ arguments), tokens and time. That shows things the chat itself hides, such as a 
 
 The log is ~/.local/state/pipa/llm-calls.jsonl, kept under 20 MB (the older half is dropped).
 It holds your conversations: it stays on this Pi, and the page is for your tailnet only.
+
+Two things it changes, because every call passes through here:
+- Tool schemas: an `allOf` of plain types (Home Assistant's fan percentage is "integer" and
+  "number 0-100") becomes one type. llama.cpp turns that allOf into a grammar that only allows
+  `{}`, so the model could never pass the number.
+- The pause switch: a message that is just "pare" pauses PiPA. From then on every call to the
+  model gets a fixed reply instead, so no tool runs (house, reminders, links): a running task
+  stops at its next step. "despausar" ends the pause. Plain words, not /commands: nanobot's
+  Telegram channel drops any /command it doesn't know. The pause is a file
+  (~/.local/state/pipa/pausada), so it survives restarts; nanobot's own /stop cancels the
+  running task at once, without pausing.
 """
 
 import hashlib
@@ -21,9 +32,11 @@ import http.client
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,8 +47,15 @@ PROXY_PORT = int(os.environ.get("PIPA_LLM_LOG_PORT", "8902"))
 PAGE_PORT = int(os.environ.get("PIPA_LLM_LOG_PAGE_PORT", "8903"))
 LOG = Path.home() / ".local/state/pipa/llm-calls.jsonl"
 PROMPTS = LOG.parent / "llm-prompts"
+LINKS_DB = LOG.parent / "links.sqlite3"  # pipa_links' catalog, shown at /links
 MAX_BYTES = 20 * 1024 * 1024
 TAIL = 8  # messages kept per call, besides the system prompt
+PAUSE = LOG.parent / "pausada"
+PAUSE_WORDS = {"pare", "parar", "pare tudo", "para tudo"}
+RESUME_WORDS = {"despausar", "despausa"}
+PAUSED_NOW = "Parei. Não executo mais nada (casa, lembretes, links) até você mandar \"despausar\"."
+PAUSED = "Estou pausada por segurança: não executo nada até você mandar \"despausar\"."
+RESUMED = "Voltei. Pode mandar."
 TIMEOUT = 900
 _lock = threading.Lock()
 
@@ -151,6 +171,38 @@ def summarize_request(body, channel):
     }
 
 
+def command_word(text):
+    """The message as a command: lowercase, without the voice bridge's prefix and end punctuation."""
+    text = re.sub(r"^\(por voz;[^)]*\)\s*", "", (text or "").strip())
+    return re.sub(r"[!.?\s]+$", "", text.lower())
+
+
+def flatten_schema(node):
+    """Merges an allOf of plain types into one schema (see the module's docstring)."""
+    if isinstance(node, list):
+        return [flatten_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    parts = node.get("allOf")
+    if (isinstance(parts, list) and parts and all(isinstance(s, dict) and "properties" not in s
+                                                     and s.get("type") in ("integer", "number", "string", "boolean")
+                                                     for s in parts)):
+        types = {s["type"] for s in parts}
+        merged_type = ("integer" if types == {"integer", "number"} else next(iter(types)) if len(types) == 1 else None)
+        if merged_type:
+            merged = {"type": merged_type}
+            for s in parts:
+                for key, value in s.items():
+                    if key == "minimum":
+                        merged[key] = max(merged.get(key, value), value)
+                    elif key == "maximum":
+                        merged[key] = min(merged.get(key, value), value)
+                    elif key != "type":
+                        merged.setdefault(key, value)
+            node = {**merged, **{k: v for k, v in node.items() if k != "allOf"}}
+    return {key: flatten_schema(value) for key, value in node.items()}
+
+
 def write_log(entry):
     with _lock:
         LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -212,7 +264,31 @@ class Proxy(BaseHTTPRequestHandler):
         logged = method == "POST" and self.path.rstrip("/").endswith("/chat/completions")
         if logged and not hasattr(self, "channel"):  # once per connection (they are reused)
             self.channel = channel_of(caller_of(self.client_address[1]))
-        request = summarize_request(json.loads(raw or b"{}"), self.channel) if logged else None
+        request = None
+        if logged:
+            body = json.loads(raw or b"{}")
+            if body.get("tools"):
+                fixed = flatten_schema(body["tools"])
+                if fixed != body["tools"]:
+                    body["tools"] = fixed
+                    raw = json.dumps(body, ensure_ascii=False).encode()
+            request = summarize_request(body, self.channel)
+            word = command_word(request["user"])
+            reply = None
+            if word in RESUME_WORDS:
+                PAUSE.unlink(missing_ok=True)
+                reply = RESUMED
+            elif word in PAUSE_WORDS and not PAUSE.exists():
+                PAUSE.parent.mkdir(parents=True, exist_ok=True)
+                PAUSE.write_text(f"{datetime.now().isoformat(timespec='seconds')} {request['channel']}\n")
+                reply = PAUSED_NOW
+            elif PAUSE.exists():
+                reply = PAUSED
+            if reply:
+                self.reply_without_model(body, reply)
+                write_log({"time": datetime.now().isoformat(timespec="seconds"), **request, "status": 200,
+                           "content": reply, "paused": True, "seconds": round(time.monotonic() - start, 2)})
+                return
         connection = http.client.HTTPConnection(UPSTREAM.hostname, UPSTREAM.port or 80, timeout=TIMEOUT)
         try:
             connection.request(method, path, body=raw or None, headers=headers)
@@ -253,6 +329,30 @@ class Proxy(BaseHTTPRequestHandler):
         if logged:
             write_log({"time": datetime.now().isoformat(timespec="seconds"), **request, "status": upstream.status,
                        **(result or {}), "seconds": round(time.monotonic() - start, 2)})
+
+    def reply_without_model(self, body, text):
+        """An OpenAI-style answer with this text and no tool calls, streamed if it was asked so."""
+        common = {"id": f"pipa-{int(time.time() * 1000)}", "created": int(time.time()), "model": body.get("model")}
+        if body.get("stream"):
+            chunks = [{**common, "object": "chat.completion.chunk",
+                       "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]},
+                      {**common, "object": "chat.completion.chunk",
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+            data = "".join(f"data: {json.dumps(c, ensure_ascii=False)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+            kind = "text/event-stream"
+        else:
+            data = json.dumps({**common, "object": "chat.completion",
+                               "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                            "finish_reason": "stop"}],
+                               "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
+                              ensure_ascii=False)
+            kind = "application/json"
+        data = data.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         self.forward("GET")
@@ -319,7 +419,8 @@ GAP = timedelta(minutes=15)  # a longer pause starts a new block
 # Claude's test conversations are named "teste-..." (through the bridge or the API) or
 # "bench-..." (pipa-gabe/bench); nanobot's own prompts are recognized by their wording.
 TEST_SESSION = re.compile(r"(^|[:_-])(teste|bench)", re.I)
-INTERNAL = [("Dream (memória de longo prazo)", re.compile(r"You are running Dream", re.I)),
+INTERNAL = [("catálogo de links", re.compile(r"^\[catálogo de links\]", re.M)),
+            ("Dream (memória de longo prazo)", re.compile(r"You are running Dream", re.I)),
             ("resumo da conversa", re.compile(r"compact replacement checkpoint|retained fact|summar", re.I))]
 SOURCES = {"you": "Você", "claude": "Claude (testes)", "pipa": "PiPA (por conta própria)"}
 CLAIM = re.compile(r"\b(agendei|anotei|liguei|desliguei|criei|marquei|lembrete criado)\b", re.I)
@@ -337,6 +438,12 @@ def internal_kind(c):
     return next((kind for kind, pattern in INTERNAL if pattern.search(text)), None)
 
 
+def is_subcall(c):
+    """A tool's own call to the model on behalf of a conversation (pipa_links summarizing a
+    page): it carries that conversation's session and shows inside it."""
+    return bool(c.get("session")) and internal_kind(c) == "catálogo de links"
+
+
 def source_of(c):
     """Who started a call: you (Telegram, or Home Assistant's voice later), Claude testing
     PiPA, or PiPA on its own (Dream, memory, a reminder firing)."""
@@ -346,7 +453,11 @@ def source_of(c):
         turn = "Channel:" in last_user_text(c)
     if c.get("channel") in ("terminal", "teste", "?") or TEST_SESSION.search(session):
         return "claude"
-    if internal_kind(c) or session.startswith(("cron", "heartbeat", "dream", "system")):
+    if session.startswith(("cron", "heartbeat", "dream", "system")):
+        return "pipa"
+    if is_subcall(c):
+        return "you"
+    if internal_kind(c):
         return "pipa"
     if c.get("channel") == "voz" and not session:  # before sessions were logged, only Claude used voice
         return "claude"
@@ -376,7 +487,7 @@ def blocks_of(calls):
             open_blocks[key] = block
             blocks.append(block)
         block["last"] = when
-        if c.get("after_tool") and block["turns"]:
+        if (c.get("after_tool") or is_subcall(c)) and block["turns"]:
             block["turns"][-1].append(c)
         else:
             block["turns"].append([c])
@@ -395,7 +506,9 @@ def render_turn(turn, source):
     if source == "pipa":
         asked = asked[:160] + ("…" if len(asked) > 160 else "")
     who = {"you": "Você", "claude": "Claude", "pipa": "Tarefa"}[source]
-    steps = "".join(tool_line(t) for c in turn for t in c.get("tool_calls") or [])
+    steps = "".join(f'<div class="step meta">↳ o modelo resumiu a página ({c.get("seconds", "?")} s)</div>'
+                    if is_subcall(c) else "".join(tool_line(t) for t in c.get("tool_calls") or [])
+                    for c in turn)
     reply = last.get("content") or ""
     used_tool = any(c.get("tool_calls") for c in turn)
     flag = ('<span class="flag">diz que fez algo sem chamar ferramenta</span>'
@@ -412,6 +525,14 @@ def render_turn(turn, source):
             f'<div class="msg"><b>{who}:</b> {html.escape(asked[:600])}</div>{steps}'
             f'<div class="msg"><b>PiPA:</b> {html.escape(reply[:800])} {flag}</div>{error}'
             f'<details><summary>tudo o que foi enviado e recebido</summary>{raw}</details></div>')
+
+
+def pause_banner():
+    if not PAUSE.exists():
+        return ""
+    since = PAUSE.read_text().split()[0] if PAUSE.read_text().strip() else "?"
+    return (f'<p class="flag" style="font-size:16px">⏸ PiPA pausada desde {html.escape(since)}: '
+            f'não executa nada até receber "despausar".</p>')
 
 
 def render(calls):
@@ -434,11 +555,90 @@ def render(calls):
     body = "".join(sections) or "<p>Nada registrado ainda.</p>"
     return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" '
             f'content="width=device-width, initial-scale=1"><title>PiPA: chamadas ao modelo</title>'
-            f'<style>{PAGE_STYLE}</style></head><body><main><h1>PiPA: chamadas ao modelo</h1>'
-            f'<p class="sub">Conversas mais recentes primeiro. Cada bloco junta as mensagens de uma conversa '
+            f'<style>{PAGE_STYLE}</style></head><body><main><h1>PiPA: chamadas ao modelo</h1>{NAV}'
+            f'{pause_banner()}<p class="sub">Conversas mais recentes primeiro. Cada bloco junta as mensagens de uma conversa '
             f'sem pausa maior que {GAP.seconds // 60} minutos; cada mensagem mostra as ferramentas que o '
             f'modelo chamou e a resposta final.</p><div class="filters">{filters}</div>{body}</main>'
             f'<script>{PAGE_SCRIPT}</script></body></html>')
+
+
+NAV = '<nav class="meta"><a href="./">Chamadas ao modelo</a> · <a href="links">Links salvos</a></nav>'
+LINKS_STYLE = """
+.search { display: flex; gap: 8px; margin: 10px 0; } .search input { flex: 1; min-width: 0; padding: 6px 10px;
+  border-radius: 8px; border: 1px solid rgba(127,127,127,.4); background: var(--card); color: var(--text); font: inherit; }
+.search button { padding: 6px 14px; border-radius: 8px; border: 0; background: var(--you-line); color: #fff; font: inherit; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 14px; }
+.tag { border-radius: 999px; padding: 2px 10px; font-size: 13px; background: var(--you-bg); color: var(--text);
+  text-decoration: none; border: 1px solid transparent; white-space: nowrap; display: inline-block; margin: 1px 0; }
+.tag.on { border-color: var(--you-line); font-weight: 600; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid rgba(127,127,127,.18); }
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+td.title { min-width: 170px; } td.title a { font-weight: 600; overflow-wrap: break-word; } td.summary { font-size: 14px; } td.date { white-space: nowrap; }
+.note { color: var(--muted); font-size: 13px; margin-top: 4px; }
+@media (max-width: 700px) { thead { display: none; } table, tbody, tr, td { display: block; width: auto; }
+  tr { border-bottom: 1px solid rgba(127,127,127,.25); padding: 6px 0; } td { border: 0; padding: 3px 10px; } }
+"""
+
+
+def norm_tag(tag):
+    tag = unicodedata.normalize("NFKD", (tag or "").strip().lower().lstrip("#"))
+    tag = "".join(ch for ch in tag if not unicodedata.combining(ch))
+    return re.sub(r"[\s_]+", "-", tag).strip("-")
+
+
+def render_links(query):
+    """The link catalog pipa_links keeps, as a table: filter by tag or kind, search words."""
+    tag, kind = norm_tag((query.get("tag") or [""])[0]), (query.get("kind") or [""])[0]
+    words = [w for w in re.findall(r"\w+", (query.get("q") or [""])[0].lower()) if len(w) >= 3][:8]
+    rows, counts, total = [], {}, 0
+    if LINKS_DB.exists():
+        db = sqlite3.connect(f"file:{LINKS_DB}?mode=ro", uri=True)
+        try:
+            total = db.execute("select count(*) from links").fetchone()[0]
+            for (tags,) in db.execute("select tags from links"):
+                for t in filter(None, (tags or "").split(",")):
+                    counts[t] = counts.get(t, 0) + 1
+            where, args, source = [], [], "links l"
+            if tag:
+                where.append("',' || l.tags || ',' like ?")
+                args.append(f"%,{tag},%")
+            if kind:
+                where.append("l.kind = ?")
+                args.append(kind)
+            if words:
+                source = "links l join links_fts on links_fts.rowid = l.id"
+                where.append("links_fts match ?")
+                args.append(" OR ".join(f'"{w}"*' for w in words))
+            order = "bm25(links_fts), l.added desc" if words else "l.added desc"
+            rows = db.execute(f"select l.url, l.title, l.summary, l.kind, l.tags, l.note, l.added from {source}"
+                              f"{' where ' + ' and '.join(where) if where else ''} order by {order} limit 500",
+                              args).fetchall()
+        finally:
+            db.close()
+    chips = [f'<a class="tag{"" if tag else " on"}" href="links">todas ({total})</a>']
+    chips += [f'<a class="tag{" on" if t == tag else ""}" href="links?tag={html.escape(t)}">{html.escape(t)} ({n})</a>'
+              for t, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    body = []
+    for url, title, summary, kind_, tags, note, added in rows:
+        safe = url if url.startswith(("http://", "https://")) else "#"
+        tag_links = " ".join(f'<a class="tag" href="links?tag={html.escape(t)}">{html.escape(t)}</a>'
+                             for t in filter(None, (tags or "").split(",")))
+        note_html = f'<div class="note">comentário: {html.escape(note)}</div>' if note else ""
+        body.append(f'<tr><td class="date meta">{added[8:10]}/{added[5:7]}/{added[:4]}</td>'
+                    f'<td class="title"><a href="{html.escape(safe)}" target="_blank" rel="noopener noreferrer">'
+                    f'{html.escape(title or url)}</a><div class="meta">{html.escape(kind_ or "")}</div></td>'
+                    f'<td>{tag_links}</td><td class="summary">{html.escape(summary or "")}{note_html}</td></tr>')
+    shown = (f"{len(rows)} de {total} links" if (tag or kind or words) else f"{total} links") if total else "Nenhum link ainda: mande um para a PiPA no Telegram."
+    table = ('<table><thead><tr><th>Data</th><th>Título</th><th>Tags</th><th>Resumo</th></tr></thead>'
+             f'<tbody>{"".join(body)}</tbody></table>') if body else ""
+    q = html.escape(" ".join(words))
+    return (f'<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" '
+            f'content="width=device-width, initial-scale=1"><title>PiPA: links salvos</title>'
+            f'<style>{PAGE_STYLE}{LINKS_STYLE}</style></head><body><main><h1>PiPA: links salvos</h1>{NAV}'
+            f'<form class="search" method="get" action="links"><input name="q" value="{q}" '
+            f'placeholder="buscar no título, resumo ou comentário"><button>Buscar</button></form>'
+            f'<div class="tags">{"".join(chips)}</div><p class="sub">{shown}</p>{table}</main></body></html>')
 
 
 class Page(BaseHTTPRequestHandler):
@@ -451,6 +651,8 @@ class Page(BaseHTTPRequestHandler):
             data, kind = json.dumps(calls, ensure_ascii=False).encode(), "application/json"
         elif prompt and (PROMPTS / f"{prompt.group(1)}.txt").exists():
             data, kind = (PROMPTS / f"{prompt.group(1)}.txt").read_bytes(), "text/plain; charset=utf-8"
+        elif url.path == "/links":
+            data, kind = render_links(parse_qs(url.query)).encode(), "text/html; charset=utf-8"
         elif url.path == "/":
             data, kind = render(read_calls(limit)).encode(), "text/html; charset=utf-8"
         else:

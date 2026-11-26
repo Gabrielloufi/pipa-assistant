@@ -10,5 +10,9 @@ PIPA_CONTEXT=16384
 # Home Assistant, for its MCP server (device control) once HA_TOKEN is in the secrets file
 HA_URL=http://127.0.0.1:8123
 
+# Voice notes (Telegram): a Wyoming speech-to-text server, such as wyoming-faster-whisper on
+# a PC with a GPU; leave empty to keep voice notes off
+STT_URL=tcp://192.168.0.10:10300
+
 # Record nanobot's calls to the model, for the page on port 8903 (8444 on the tailnet); 0 = off
 PIPA_LLM_LOG=1
