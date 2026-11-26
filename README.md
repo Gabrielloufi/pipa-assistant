@@ -81,6 +81,13 @@ Put the tokens in `~/.config/pipa/secrets.env` (`nano ~/.config/pipa/secrets.env
   Create. Also add the **Model Context Protocol Server** integration (Settings → Devices &
   services → Add integration), with Assist (device control). PiPA then sees and controls the
   devices you expose to voice assistants.
+- **After exposing a new script, restart PiPA:** `systemctl --user restart pipa-gateway
+  pipa-api`.
+  - Each exposed script is a tool of its own, and nanobot reads Home Assistant's list of tools
+    only when it starts.
+  - Until the restart it doesn't see the new script, and a small model may pick a similar one
+    instead (another room's).
+  - Newly exposed devices need no restart, because the general tools find them by name.
 - `TELEGRAM_TOKEN` and `TELEGRAM_ALLOW_FROM`: create a bot with @BotFather; your numeric
   Telegram user ID comes from @userinfobot. Only that ID can talk to the bot.
 
