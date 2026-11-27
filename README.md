@@ -35,6 +35,7 @@ Telegram ─> nanobot gateway ─┘
 | `pipa_clock/` | nanobot's environment | A nanobot plugin: gives the model the current time and the channel on every turn. |
 | `pipa_calendar/` | nanobot's environment | A nanobot plugin: reads your Google Calendar and adds events to it, once authorized. |
 | `pipa_links/` | nanobot's environment | A nanobot plugin: reads a link you send, summarizes and tags it, and finds it again later. |
+| `pipa_tv/` | nanobot's environment | A nanobot plugin: works a [couchPie](https://github.com/Gabrielloufi/couchpie) TV box on the same machine (puts a Netflix title on, opens an app, turns the TV on or off). Loads only where couchPie's `kiosk` is installed. |
 | `pipa-stt` | `~/.local/bin/pipa-stt` | Speech to text for voice notes: an OpenAI-style endpoint that asks your own Wyoming server (Whisper). |
 | `pipa-google-auth` | `~/.local/bin/pipa-google-auth` | Authorizes PiPA to use your Google Calendar, once, from a computer with a browser. |
 | `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, the bridge and the call log, as user services. |

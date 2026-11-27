@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pipa-tv"
+version = "0.1.0"
+description = "nanobot plugin: the couchPie TV box's remote (open apps, play a Netflix title, TV power)"
+requires-python = ">=3.11"
+
+[project.entry-points."nanobot.tools"]
+tv_assistir = "pipa_tv:TvWatchTool"
+tv_abrir = "pipa_tv:TvOpenTool"
+tv_energia = "pipa_tv:TvPowerTool"
+
+[tool.setuptools]
+py-modules = ["pipa_tv"]
