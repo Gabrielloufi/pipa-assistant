@@ -59,9 +59,9 @@ if [ "$("$VENV/bin/nanobot" --version 2>/dev/null | grep -o '[0-9.]*$')" != "$NA
 fi
 "$VENV/bin/nanobot" --version
 # PiPA's nanobot plugins: the time on every turn (nanobot doesn't give it), Google
-# Calendar (its tools load only once its authorization is in the secrets), and the link
-# catalog
-for plugin in pipa_clock pipa_calendar pipa_links; do
+# Calendar (its tools load only once its authorization is in the secrets), the link
+# catalog, and the TV remote (its tools load only where couchPie's kiosk is installed)
+for plugin in pipa_clock pipa_calendar pipa_links pipa_tv; do
     "$VENV/bin/pip" install -q --no-deps --force-reinstall "$HERE/$plugin"
 done
 # pipa-stt talks Wyoming to the speech-to-text server
