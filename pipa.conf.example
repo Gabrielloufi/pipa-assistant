@@ -14,5 +14,10 @@ HA_URL=http://127.0.0.1:8123
 # a PC with a GPU; leave empty to keep voice notes off
 STT_URL=tcp://192.168.0.10:10300
 
+# PiPA's voice outside Home Assistant (the couchPie phone remote reads her answers aloud): a
+# Wyoming text-to-speech server and its voice (empty = the server's default); needs STT_URL
+TTS_URL=
+TTS_VOICE=
+
 # Record nanobot's calls to the model, for the page on port 8903 (8444 on the tailnet); 0 = off
 PIPA_LLM_LOG=1

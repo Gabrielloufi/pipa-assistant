@@ -1,5 +1,5 @@
 [Unit]
-Description=PiPA: speech to text for voice notes (127.0.0.1:8904 -> a Wyoming server such as Whisper)
+Description=PiPA: speech to text and text to speech (127.0.0.1:8904 -> Wyoming servers such as Whisper)
 After=network-online.target
 
 [Service]
