@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Speech to text for PiPA's voice notes, with your own Whisper instead of a cloud service.
+"""PiPA's speech, with your own Whisper and voice instead of a cloud service.
 
-nanobot transcribes Telegram voice notes by posting them to an OpenAI-style
-/v1/audio/transcriptions endpoint. This is that endpoint, on 127.0.0.1:8904: it converts the
-audio with ffmpeg (Telegram sends OGG/Opus) to 16 kHz mono PCM and asks a Wyoming speech-to-text
-server for the text, such as wyoming-faster-whisper on a PC with a GPU (the one Home
-Assistant's voice already uses). Nothing is loaded here, so it costs no memory on the Pi.
+OpenAI-style endpoints on 127.0.0.1:8904, in front of Wyoming servers such as the ones Home
+Assistant's voice already uses (on a PC with a GPU). Nothing is loaded here, so it costs no
+memory on the Pi.
 
-  PIPA_STT_WYOMING   the Wyoming server, e.g. tcp://192.168.0.10:10300 (required)
-  PIPA_STT_LANGUAGE  default language when nanobot doesn't send one (pt)
+  POST /v1/audio/transcriptions  speech to text. nanobot posts Telegram's voice notes here; the
+                                 couchPie phone remote, what the phone heard. The audio (any
+                                 format ffmpeg reads) goes to the Wyoming speech-to-text server
+                                 as 16 kHz mono PCM.
+  POST /v1/audio/speech          text to speech: {"input": "...", "voice": "..."} -> WAV, from
+                                 the Wyoming text-to-speech server. The phone remote reads
+                                 PiPA's answers aloud with it.
+
+  PIPA_STT_WYOMING   the speech-to-text server, e.g. tcp://192.168.0.10:10300 (required)
+  PIPA_STT_LANGUAGE  default language when the caller doesn't send one (pt)
+  PIPA_TTS_WYOMING   the text-to-speech server, e.g. tcp://192.168.0.10:10200 (optional)
+  PIPA_TTS_VOICE     its voice, when the caller doesn't name one (optional: the server's default)
   PIPA_STT_PORT      8904
 
 Run with PiPA's Python environment, which has the `wyoming` package (install.sh adds it).
@@ -18,26 +26,32 @@ import asyncio
 import email.parser
 import email.policy
 import json
+import io
 import os
 import subprocess
 import sys
 import time
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from wyoming.asr import Transcribe, Transcript
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncTcpClient
+from wyoming.tts import Synthesize, SynthesizeVoice
 
 SERVER = urlsplit(os.environ.get("PIPA_STT_WYOMING", ""))
 LANGUAGE = os.environ.get("PIPA_STT_LANGUAGE", "pt")
+TTS_SERVER = urlsplit(os.environ.get("PIPA_TTS_WYOMING", ""))
+TTS_VOICE = os.environ.get("PIPA_TTS_VOICE", "")
 PORT = int(os.environ.get("PIPA_STT_PORT", "8904"))
+MAX_TEXT = 2000
 RATE, WIDTH, CHANNELS = 16000, 2, 1
 CHUNK = RATE * WIDTH // 10  # 100 ms
 MAX_BYTES = 25 * 1024 * 1024
 
 
-class SttError(Exception):
+class SpeechError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
@@ -49,7 +63,7 @@ def to_pcm(audio: bytes) -> bytes:
                           "-f", "s16le", "-ac", str(CHANNELS), "-ar", str(RATE), "pipe:1"],
                          input=audio, capture_output=True, timeout=60)
     if run.returncode != 0 or not run.stdout:
-        raise SttError(400, f"couldn't decode the audio: {run.stderr.decode(errors='replace')[-200:]}")
+        raise SpeechError(400, f"couldn't decode the audio: {run.stderr.decode(errors='replace')[-200:]}")
     return run.stdout
 
 
@@ -65,13 +79,42 @@ async def transcribe(pcm: bytes, language: str) -> str:
             while True:
                 event = await asyncio.wait_for(client.read_event(), timeout=120)
                 if event is None:
-                    raise SttError(502, "the speech-to-text server closed the connection")
+                    raise SpeechError(502, "the speech-to-text server closed the connection")
                 if Transcript.is_type(event.type):
                     return " ".join(Transcript.from_event(event).text.split())
     except OSError as err:  # the PC is off or asleep, or its server is down
-        raise SttError(503, f"speech-to-text server unreachable ({SERVER.netloc}): {err}")
+        raise SpeechError(503, f"speech-to-text server unreachable ({SERVER.netloc}): {err}")
     except asyncio.TimeoutError:
-        raise SttError(504, "the speech-to-text server took too long")
+        raise SpeechError(504, "the speech-to-text server took too long")
+
+
+async def synthesize(text: str, voice: str) -> bytes:
+    """TEXT spoken by the text-to-speech server, as a WAV file."""
+    audio, fmt = bytearray(), None
+    try:
+        async with AsyncTcpClient(TTS_SERVER.hostname, TTS_SERVER.port or 10200) as client:
+            await client.write_event(Synthesize(text=text, voice=SynthesizeVoice(name=voice) if voice else None).event())
+            while True:
+                event = await asyncio.wait_for(client.read_event(), timeout=120)
+                if event is None:
+                    raise SpeechError(502, "the text-to-speech server closed the connection")
+                if AudioChunk.is_type(event.type):
+                    chunk = AudioChunk.from_event(event)
+                    fmt = (chunk.rate, chunk.width, chunk.channels)
+                    audio += chunk.audio
+                elif AudioStop.is_type(event.type):
+                    break
+    except OSError as err:
+        raise SpeechError(503, f"text-to-speech server unreachable ({TTS_SERVER.netloc}): {err}")
+    except asyncio.TimeoutError:
+        raise SpeechError(504, "the text-to-speech server took too long")
+    if not audio:
+        raise SpeechError(502, "the text-to-speech server sent no audio")
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setframerate(fmt[0]); wav.setsampwidth(fmt[1]); wav.setnchannels(fmt[2])
+        wav.writeframes(bytes(audio))
+    return out.getvalue()
 
 
 def form_fields(content_type: str, body: bytes) -> dict[str, bytes]:
@@ -82,21 +125,27 @@ def form_fields(content_type: str, body: bytes) -> dict[str, bytes]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def reply(self, status: int, payload: dict | str, kind: str = "application/json") -> None:
-        data = (json.dumps(payload, ensure_ascii=False) if kind == "application/json" else payload).encode()
+    def reply(self, status: int, payload: dict | str | bytes, kind: str = "application/json") -> None:
+        if isinstance(payload, bytes):
+            data = payload
+        else:
+            data = (json.dumps(payload, ensure_ascii=False) if kind == "application/json" else payload).encode()
+            kind += "; charset=utf-8"
         self.send_response(status)
-        self.send_header("Content-Type", f"{kind}; charset=utf-8")
+        self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         if self.path.rstrip("/") in ("", "/health", "/v1/models"):
-            self.reply(200, {"status": "ok", "server": SERVER.netloc})
+            self.reply(200, {"status": "ok", "server": SERVER.netloc, "tts": TTS_SERVER.netloc or None})
         else:
             self.reply(404, {"error": {"message": "not found"}})
 
     def do_POST(self):
+        if self.path.rstrip("/").endswith("/audio/speech"):
+            return self.speech()
         if not self.path.rstrip("/").endswith("/audio/transcriptions"):
             self.reply(404, {"error": {"message": "not found"}})
             return
@@ -104,14 +153,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if not 0 < length <= MAX_BYTES:
-                raise SttError(413, "audio missing or too large")
+                raise SpeechError(413, "audio missing or too large")
             fields = form_fields(self.headers.get("Content-Type", ""), self.rfile.read(length))
             if not fields.get("file"):
-                raise SttError(400, "no audio file in the request")
+                raise SpeechError(400, "no audio file in the request")
             language = (fields.get("language") or b"").decode().strip() or LANGUAGE
             pcm = to_pcm(fields["file"])
             text = asyncio.run(transcribe(pcm, language))
-        except SttError as err:
+        except SpeechError as err:
             print(f"error {err.status}: {err}", flush=True)
             self.reply(err.status, {"error": {"message": str(err)}})
             return
@@ -122,6 +171,25 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.reply(200, {"text": text})
 
+    def speech(self):
+        start = time.monotonic()
+        try:
+            if not TTS_SERVER.hostname:
+                raise SpeechError(501, "no text-to-speech server (PIPA_TTS_WYOMING)")
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}") if 0 < length <= 65536 else {}
+            text = " ".join(str(body.get("input") or "").split())[:MAX_TEXT]
+            if not text:
+                raise SpeechError(400, "no text (input)")
+            wav = asyncio.run(synthesize(text, str(body.get("voice") or TTS_VOICE)))
+        except (SpeechError, ValueError) as err:
+            status = getattr(err, "status", 400)
+            print(f"error {status}: {err}", flush=True)
+            self.reply(status, {"error": {"message": str(err)}})
+            return
+        print(f"spoke {len(text)} characters in {time.monotonic() - start:.1f} s", flush=True)
+        self.reply(200, wav, "audio/wav")
+
     def log_message(self, format, *args):
         pass
 
@@ -129,5 +197,6 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     if not SERVER.hostname:
         sys.exit("PIPA_STT_WYOMING isn't set (e.g. tcp://192.168.0.10:10300)")
-    print(f"speech to text on 127.0.0.1:{PORT} -> Wyoming {SERVER.netloc}, default language {LANGUAGE}", flush=True)
+    print(f"speech on 127.0.0.1:{PORT}: to text -> Wyoming {SERVER.netloc} (default language {LANGUAGE}); "
+          f"to speech -> {TTS_SERVER.netloc or 'none'}{f' (voice {TTS_VOICE})' if TTS_VOICE else ''}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

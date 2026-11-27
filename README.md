@@ -36,7 +36,7 @@ Telegram ─> nanobot gateway ─┘
 | `pipa_calendar/` | nanobot's environment | A nanobot plugin: reads your Google Calendar and adds events to it, once authorized. |
 | `pipa_links/` | nanobot's environment | A nanobot plugin: reads a link you send, summarizes and tags it, and finds it again later. |
 | `pipa_tv/` | nanobot's environment | A nanobot plugin: works a [couchPie](https://github.com/Gabrielloufi/couchpie) TV box on the same machine (puts a Netflix title on, opens an app, turns the TV on or off). Loads only where couchPie's `kiosk` is installed. |
-| `pipa-stt` | `~/.local/bin/pipa-stt` | Speech to text for voice notes: an OpenAI-style endpoint that asks your own Wyoming server (Whisper). |
+| `pipa-stt` | `~/.local/bin/pipa-stt` | PiPA's speech: OpenAI-style speech-to-text (voice notes) and text-to-speech endpoints in front of your own Wyoming servers (Whisper, a voice). |
 | `pipa-google-auth` | `~/.local/bin/pipa-google-auth` | Authorizes PiPA to use your Google Calendar, once, from a computer with a browser. |
 | `systemd/pipa-*.service` | `~/.config/systemd/user/` | nanobot's API, nanobot's gateway, the bridge and the call log, as user services. |
 | | `~/.local/share/pipa/venv` | nanobot 0.4.1. |
@@ -138,6 +138,18 @@ a GPU, the one Home Assistant's voice uses), the installer starts `pipa-stt` on
   about 5 s while the model loads.
 - If the server is off, the message arrives without a transcription, and PiPA says it couldn't
   hear it.
+
+### Talking to PiPA from the phone
+
+The [couchPie](https://github.com/Gabrielloufi/couchpie) phone remote has a PiPA button.
+1. The phone records, and the remote sends the audio to `pipa-stt` for the text.
+2. The remote asks PiPA through `pipa-bridge`, as Home Assistant's voice does. Each phone has
+   its own session.
+3. It reads the answer aloud with `pipa-stt`'s `/v1/audio/speech`. That endpoint is a Wyoming
+   text-to-speech server: set `TTS_URL` in `pipa.conf`, and `TTS_VOICE` for its voice. The
+   voice can be the one Home Assistant's voice uses, such as F5-TTS or Piper on the PC.
+
+Without `TTS_URL`, the phone shows the answer and speaks it with its own voice.
 - Leave `STT_URL` empty to keep voice notes off.
 
 ### Links

@@ -45,6 +45,10 @@ export PIPA_CONTEXT="${PIPA_CONTEXT:-16384}"
 # Voice notes: a Wyoming speech-to-text server (Whisper on a PC, for example); empty = off
 STT_URL="${STT_URL:-}"
 export PIPA_STT="${STT_URL:+1}"
+# PiPA's spoken answers outside Home Assistant (the couchPie phone remote): a Wyoming
+# text-to-speech server and its voice; empty = off
+TTS_URL="${TTS_URL:-}"
+TTS_VOICE="${TTS_VOICE:-}"
 # nanobot reaches the LLM through pipa-llm-log, which records each call for its page;
 # PIPA_LLM_LOG=0 in the settings connects it straight to the server instead
 if [ "${PIPA_LLM_LOG:-1}" != 0 ]; then NANOBOT_LLM=http://127.0.0.1:8902/v1; else NANOBOT_LLM=$LLM_URL; fi
@@ -114,7 +118,8 @@ install -D -m 755 "$HERE/pipa-llm-log" "$HOME/.local/bin/pipa-llm-log"
 install -D -m 755 "$HERE/pipa-google-auth" "$HOME/.local/bin/pipa-google-auth"
 install -D -m 755 "$HERE/pipa-stt" "$HOME/.local/bin/pipa-stt"
 printf "PIPA_LLM_UPSTREAM=%s\n" "$LLM_URL" > "$HOME/.config/pipa/llm-log.env"
-printf "PIPA_STT_WYOMING=%s\n" "$STT_URL" > "$HOME/.config/pipa/stt.env"
+printf "PIPA_STT_WYOMING=%s\nPIPA_TTS_WYOMING=%s\nPIPA_TTS_VOICE=%s\n" "$STT_URL" "$TTS_URL" "$TTS_VOICE" \
+    > "$HOME/.config/pipa/stt.env"
 UNIT_LIST="pipa-llm-log pipa-api pipa-gateway pipa-bridge"
 if [ -n "$STT_URL" ]; then
     UNIT_LIST="pipa-stt $UNIT_LIST"
